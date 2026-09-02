@@ -1,0 +1,16 @@
+{
+  "name": "arak-extraction-server",
+  "version": "1.0.0",
+  "description": "Lightweight yt-dlp extraction backend for the Arak app. Lets mobile builds (which can't run yt-dlp locally) resolve direct video stream URLs for Facebook, Instagram, Twitter/X, TikTok, etc. using real yt-dlp extractors.",
+  "main": "server.js",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
