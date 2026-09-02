@@ -47,6 +47,12 @@ app.post('/extract', checkAuth, (req, res) => {
     '--no-playlist',
     '--no-check-certificates',
     '--socket-timeout', '20',
+    // Photo-only posts (no video track — common on Instagram/Facebook)
+    // would otherwise make yt-dlp hard-error with "There is no video in
+    // this post" and print nothing. This flag makes it still dump the
+    // metadata JSON (title/thumbnail/etc.) with an empty `formats` list,
+    // which we turn into a downloadable "photo" format below.
+    '--ignore-no-formats-error',
     url,
   ];
 
@@ -59,11 +65,9 @@ app.post('/extract', checkAuth, (req, res) => {
         const message = (stderr || err.message || '').toString();
         console.error('[extract] yt-dlp failed:', message);
 
-        // Instagram photo-only posts (no video track) are a real, common
-        // case yt-dlp intentionally refuses ("There is no video in this
-        // post") since it only handles video extraction. Fall back to
-        // scraping the post's og:image so the app can still offer a photo
-        // download instead of a dead end.
+        // Last-resort fallback for Instagram photo posts if the flag above
+        // still didn't yield metadata for some reason: scrape the public
+        // page's og:image directly.
         if (url.includes('instagram.com') && /no video in this post/i.test(message)) {
           const photoJson = await tryExtractInstagramPhoto(url);
           if (photoJson) return res.json(photoJson);
@@ -79,9 +83,38 @@ app.post('/extract', checkAuth, (req, res) => {
         // the JSON payload is always the last non-empty line.
         const lines = stdout.trim().split('\n').filter(Boolean);
         const json = JSON.parse(lines[lines.length - 1]);
+
+        // Photo-only post: --ignore-no-formats-error lets this through with
+        // an empty/missing `formats` array but a real `thumbnail`/`url`
+        // pointing at the full-resolution image. Synthesize a single
+        // "photo" format from it so the app has something to download.
+        if ((!json.formats || json.formats.length === 0)) {
+          const imageUrl = json.thumbnail || json.url;
+          if (imageUrl) {
+            json.formats = [
+              {
+                format_id: 'photo',
+                ext: 'jpg',
+                vcodec: 'none',
+                acodec: 'none',
+                format_note: 'Photo',
+                url: imageUrl,
+              },
+            ];
+          }
+        }
+
         return res.json(json);
       } catch (parseErr) {
         console.error('[extract] failed to parse yt-dlp output:', parseErr.message);
+
+        // Same Instagram photo fallback if --ignore-no-formats-error still
+        // produced no parseable JSON line.
+        if (url.includes('instagram.com')) {
+          const photoJson = await tryExtractInstagramPhoto(url);
+          if (photoJson) return res.json(photoJson);
+        }
+
         return res.status(502).json({ error: 'parse_failed', message: parseErr.message });
       }
     }
