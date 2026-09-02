@@ -27,7 +27,14 @@ class DownloadFormat {
     this.directUrl,
   });
 
+  /// True for a still-image result (e.g. an Instagram photo post with no
+  /// video track) rather than an actual video/audio stream.
+  bool get isImage => !hasVideo && !hasAudio;
+
   String get displayLabel {
+    if (isImage) {
+      return 'Photo ($ext)';
+    }
     if (isAudioOnly) {
       final rate = abr != null ? '${abr}kbps' : (note.isNotEmpty ? note : 'High Quality');
       return 'Audio ($ext) • $rate';

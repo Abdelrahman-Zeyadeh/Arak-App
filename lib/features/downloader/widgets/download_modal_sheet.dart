@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 import '../../../core/localization/app_localizations.dart';
 import '../../../core/theme/app_colors.dart';
+import '../../downloads_library/services/downloads_library_service.dart';
 import '../models/download_format.dart';
 import '../models/video_metadata.dart';
 import '../services/download_queue_service.dart';
@@ -102,9 +103,57 @@ class _DownloadModalSheetState extends ConsumerState<DownloadModalSheet>
     }
   }
 
-  void _startDownload() {
+  Future<void> _startDownload() async {
     if (_selectedFormat == null) return;
     final l10n = AppLocalizations.of(context);
+    final resolution = _selectedFormat!.resolution;
+
+    // Duplicate detection: warn before queueing the exact same video at the
+    // exact same quality twice, whether it's already finished or already
+    // sitting in the queue.
+    final existingTask = DownloadQueueService().findActiveTask(widget.initialUrl, resolution: resolution);
+    if (existingTask != null) {
+      if (!mounted) return;
+      await showDialog(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: Text(l10n.translate('already_queued_title')),
+          content: Text(l10n.translate('already_queued_message')),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: Text(l10n.translate('cancel')),
+            ),
+          ],
+        ),
+      );
+      return;
+    }
+
+    final existingItem = await DownloadsLibraryService().findByUrl(widget.initialUrl, resolution: resolution);
+    if (existingItem != null) {
+      if (!mounted) return;
+      final proceed = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: Text(l10n.translate('already_downloaded_title')),
+          content: Text(l10n.translate('already_downloaded_message')),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: Text(l10n.translate('cancel')),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.of(ctx).pop(true),
+              child: Text(l10n.translate('download_anyway')),
+            ),
+          ],
+        ),
+      );
+      if (proceed != true) return;
+    }
+
+    if (!mounted) return;
 
     final title = _titleController.text.trim().isNotEmpty
         ? _titleController.text.trim()
@@ -150,7 +199,7 @@ class _DownloadModalSheetState extends ConsumerState<DownloadModalSheet>
     final isDark = Theme.of(context).brightness == Brightness.dark;
 
     final videoFormats = (_metadata?.formats ?? [])
-        .where((f) => !f.isAudioOnly && f.resolution.isNotEmpty)
+        .where((f) => !f.isAudioOnly && (f.resolution.isNotEmpty || f.isImage))
         .toList();
     final audioFormats = (_metadata?.formats ?? [])
         .where((f) => f.isAudioOnly || f.abr != null)

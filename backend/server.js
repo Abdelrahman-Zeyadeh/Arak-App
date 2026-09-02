@@ -54,12 +54,24 @@ app.post('/extract', checkAuth, (req, res) => {
     YTDLP_PATH,
     args,
     { maxBuffer: 1024 * 1024 * 25, timeout: 45000 },
-    (err, stdout, stderr) => {
+    async (err, stdout, stderr) => {
       if (err) {
-        console.error('[extract] yt-dlp failed:', stderr || err.message);
+        const message = (stderr || err.message || '').toString();
+        console.error('[extract] yt-dlp failed:', message);
+
+        // Instagram photo-only posts (no video track) are a real, common
+        // case yt-dlp intentionally refuses ("There is no video in this
+        // post") since it only handles video extraction. Fall back to
+        // scraping the post's og:image so the app can still offer a photo
+        // download instead of a dead end.
+        if (url.includes('instagram.com') && /no video in this post/i.test(message)) {
+          const photoJson = await tryExtractInstagramPhoto(url);
+          if (photoJson) return res.json(photoJson);
+        }
+
         return res.status(502).json({
           error: 'extraction_failed',
-          message: (stderr || err.message || '').toString().slice(-1000),
+          message: message.slice(-1000),
         });
       }
       try {
@@ -75,6 +87,54 @@ app.post('/extract', checkAuth, (req, res) => {
     }
   );
 });
+
+// Scrapes an Instagram post's public page for its og:image / og:title meta
+// tags and returns a synthetic yt-dlp-shaped JSON payload (a single "photo"
+// format) so the app's existing formats-parsing code can handle it without
+// any extra branching. Returns null if the page can't be read.
+async function tryExtractInstagramPhoto(url) {
+  try {
+    const response = await fetch(url, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        Accept: 'text/html,application/xhtml+xml',
+      },
+    });
+    if (!response.ok) return null;
+    const html = await response.text();
+
+    const imageMatch = html.match(/<meta property="og:image" content="([^"]+)"/i);
+    const titleMatch = html.match(/<meta property="og:title" content="([^"]+)"/i);
+    const imageUrl = imageMatch ? imageMatch[1].replace(/&amp;/g, '&') : null;
+    if (!imageUrl) return null;
+
+    const idMatch = url.match(/\/(?:p|reel|reels)\/([^/?]+)/);
+    const id = idMatch ? idMatch[1] : 'instagram_photo';
+
+    return {
+      id,
+      title: titleMatch ? titleMatch[1] : 'Instagram Photo',
+      uploader: 'Instagram',
+      thumbnail: imageUrl,
+      duration: 0,
+      webpage_url: url,
+      formats: [
+        {
+          format_id: 'photo',
+          ext: 'jpg',
+          vcodec: 'none',
+          acodec: 'none',
+          format_note: 'Photo',
+          url: imageUrl,
+        },
+      ],
+    };
+  } catch (e) {
+    console.error('[extract] Instagram photo fallback failed:', e.message);
+    return null;
+  }
+}
 
 app.listen(PORT, () => {
   console.log(`Arak extraction server listening on port ${PORT}`);
