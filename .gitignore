@@ -49,3 +49,7 @@ app.*.map.json
 
 # Widget Preview related
 .widget_preview/
+
+# Never commit real YouTube session cookies (used as a backend PO Token workaround)
+backend/cookies.txt
+**/cookies.txt

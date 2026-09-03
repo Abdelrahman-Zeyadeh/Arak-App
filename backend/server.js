@@ -37,6 +37,20 @@ const YTDLP_PLUGIN_DIRS = process.env.YTDLP_PLUGIN_DIRS || '';
 const BGUTIL_SERVER_PATH = process.env.BGUTIL_SERVER_PATH || '';
 const BGUTIL_BASE_URL = process.env.BGUTIL_BASE_URL || 'http://127.0.0.1:4416';
 
+// Second, independent workaround for the same PO Token problem: a real
+// signed-in session (cookies) plus a specific player client is what actual
+// browsers/apps present, and yt-dlp is more permissive with those than an
+// anonymous request. Set COOKIES_PATH to a cookies.txt exported from a
+// real, signed-in YouTube session (e.g. via Render's "Secret Files", so it
+// never touches git) and this gets passed straight to yt-dlp. Never commit
+// a real cookies.txt to the repo — it's equivalent to a login session.
+const COOKIES_PATH = process.env.COOKIES_PATH || '';
+// Comma-separated client list for yt-dlp's `player_client` extractor-arg
+// (e.g. "android,web"). Left unset by default so yt-dlp keeps using its own
+// built-in client-selection logic; only override this if testing shows a
+// specific client combination works better against the current break.
+const PLAYER_CLIENT = process.env.PLAYER_CLIENT || '';
+
 function checkAuth(req, res, next) {
   if (!API_KEY) return next();
   if (req.headers['x-api-key'] === API_KEY) return next();
@@ -159,8 +173,16 @@ function ytdlpArgs(url) {
   if (YTDLP_PLUGIN_DIRS) {
     args.push('--plugin-dirs', YTDLP_PLUGIN_DIRS);
   }
-  if (isYoutubeUrl(url) && YTDLP_PLUGIN_DIRS) {
-    args.push('--extractor-args', `youtubepot-bgutilhttp:base_url=${BGUTIL_BASE_URL}`);
+  if (isYoutubeUrl(url)) {
+    if (YTDLP_PLUGIN_DIRS) {
+      args.push('--extractor-args', `youtubepot-bgutilhttp:base_url=${BGUTIL_BASE_URL}`);
+    }
+    if (PLAYER_CLIENT) {
+      args.push('--extractor-args', `youtube:player_client=${PLAYER_CLIENT}`);
+    }
+    if (COOKIES_PATH) {
+      args.push('--cookies', COOKIES_PATH);
+    }
   }
   args.push(url);
   return args;
