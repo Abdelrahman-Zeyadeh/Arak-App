@@ -13,6 +13,9 @@
 // path used for the desktop binary — one extraction format for every
 // platform.
 
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const express = require('express');
 const { execFile, spawn } = require('child_process');
 const ytdl = require('@distube/ytdl-core');
@@ -40,11 +43,25 @@ const BGUTIL_BASE_URL = process.env.BGUTIL_BASE_URL || 'http://127.0.0.1:4416';
 // Second, independent workaround for the same PO Token problem: a real
 // signed-in session (cookies) plus a specific player client is what actual
 // browsers/apps present, and yt-dlp is more permissive with those than an
-// anonymous request. Set COOKIES_PATH to a cookies.txt exported from a
-// real, signed-in YouTube session (e.g. via Render's "Secret Files", so it
-// never touches git) and this gets passed straight to yt-dlp. Never commit
-// a real cookies.txt to the repo — it's equivalent to a login session.
-const COOKIES_PATH = process.env.COOKIES_PATH || '';
+// anonymous request. Two ways to provide the cookies.txt content, since
+// different hosts support different secret-storage mechanisms:
+//   - COOKIES_PATH: an absolute path to an already-mounted file (e.g.
+//     Render's "Secret Files", mounted at /etc/secrets/<name>)
+//   - COOKIES_CONTENT: the raw cookies.txt text itself, for hosts (e.g.
+//     Fly.io) that only offer secret *environment variables*, no secret
+//     *files* — written out to a temp file once at startup below.
+// Never commit a real cookies.txt to the repo — it's equivalent to a
+// login session for whatever account exported it.
+let COOKIES_PATH = process.env.COOKIES_PATH || '';
+if (!COOKIES_PATH && process.env.COOKIES_CONTENT) {
+  COOKIES_PATH = path.join(os.tmpdir(), 'yt-cookies.txt');
+  try {
+    fs.writeFileSync(COOKIES_PATH, process.env.COOKIES_CONTENT, { mode: 0o600 });
+  } catch (e) {
+    console.error('[startup] failed to write COOKIES_CONTENT to disk:', e.message);
+    COOKIES_PATH = '';
+  }
+}
 // Comma-separated client list for yt-dlp's `player_client` extractor-arg
 // (e.g. "android,web"). Left unset by default so yt-dlp keeps using its own
 // built-in client-selection logic; only override this if testing shows a
