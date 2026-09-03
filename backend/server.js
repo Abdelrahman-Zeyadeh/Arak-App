@@ -15,6 +15,7 @@
 
 const express = require('express');
 const { execFile } = require('child_process');
+const ytdl = require('@distube/ytdl-core');
 
 const app = express();
 app.use(express.json({ limit: '256kb' }));
@@ -73,6 +74,20 @@ app.post('/extract', checkAuth, (req, res) => {
           if (photoJson) return res.json(photoJson);
         }
 
+        // yt-dlp is a single shared open-source project — when YouTube ships
+        // a breaking internal change, every yt-dlp install worldwide fails
+        // the same way (e.g. "Failed to extract any player response") until
+        // its maintainers ship a fix release, which can take a day or more.
+        // @distube/ytdl-core is a separate, independently-maintained
+        // extractor for YouTube specifically — often already patched for
+        // exactly this kind of break, or breaks on a different schedule —
+        // so it's a real second opinion worth trying, not just a retry of
+        // the same failure.
+        if (isYoutubeUrl(url)) {
+          const ytdlJson = await tryExtractViaYtdlCore(url);
+          if (ytdlJson) return res.json(ytdlJson);
+        }
+
         return res.status(502).json({
           error: 'extraction_failed',
           message: message.slice(-1000),
@@ -120,6 +135,53 @@ app.post('/extract', checkAuth, (req, res) => {
     }
   );
 });
+
+function isYoutubeUrl(url) {
+  return /(?:youtube\.com|youtu\.be)/i.test(url);
+}
+
+// Independent fallback extractor for YouTube, used only when yt-dlp itself
+// fails (see the comment at its call site). Reshapes @distube/ytdl-core's
+// own info/format shape into the same yt-dlp `--dump-json` shape the app
+// already parses (`VideoMetadata.fromYtDlpJson`), so no extra branching is
+// needed on the Flutter side.
+async function tryExtractViaYtdlCore(url) {
+  try {
+    const info = await ytdl.getInfo(url);
+    const details = info.videoDetails;
+    const thumbnails = details.thumbnails || [];
+    const bestThumbnail = thumbnails.length ? thumbnails[thumbnails.length - 1].url : '';
+
+    const formats = info.formats
+      .filter((f) => f.hasAudio || f.hasVideo)
+      .map((f) => ({
+        format_id: String(f.itag),
+        ext: f.container || 'mp4',
+        height: f.height || null,
+        resolution: f.qualityLabel || null,
+        format_note: f.qualityLabel || f.quality || '',
+        filesize: f.contentLength ? Number(f.contentLength) : null,
+        vcodec: f.hasVideo ? f.videoCodec || 'unknown' : 'none',
+        acodec: f.hasAudio ? f.audioCodec || 'unknown' : 'none',
+        fps: f.fps || null,
+        abr: f.audioBitrate || null,
+        url: f.url,
+      }));
+
+    return {
+      id: details.videoId,
+      title: details.title,
+      uploader: details.author ? details.author.name : '',
+      thumbnail: bestThumbnail,
+      duration: details.lengthSeconds ? parseInt(details.lengthSeconds, 10) : 0,
+      webpage_url: details.video_url || url,
+      formats,
+    };
+  } catch (e) {
+    console.error('[extract] ytdl-core fallback also failed:', e.message);
+    return null;
+  }
+}
 
 // Scrapes an Instagram post's public page for its og:image / og:title meta
 // tags and returns a synthetic yt-dlp-shaped JSON payload (a single "photo"
