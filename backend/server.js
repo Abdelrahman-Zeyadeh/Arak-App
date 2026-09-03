@@ -14,7 +14,7 @@
 // platform.
 
 const express = require('express');
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
 const ytdl = require('@distube/ytdl-core');
 
 const app = express();
@@ -25,6 +25,17 @@ const YTDLP_PATH = process.env.YTDLP_PATH || 'yt-dlp';
 // Optional shared secret so randoms can't hammer your free-tier instance.
 // Set API_KEY on the host and the same value in the app's Settings screen.
 const API_KEY = process.env.API_KEY || '';
+
+// See the Dockerfile for why these exist: YouTube now requires a PO Token
+// on most requests, so yt-dlp needs the bgutil plugin (found via
+// --plugin-dirs, since the standalone binary has no site-packages of its
+// own) talking to a locally-running token server. Both are empty in local
+// dev unless you've installed them yourself — extraction still works there,
+// just without the PO Token workaround, so it inherits whatever YouTube's
+// current anti-bot behavior is.
+const YTDLP_PLUGIN_DIRS = process.env.YTDLP_PLUGIN_DIRS || '';
+const BGUTIL_SERVER_PATH = process.env.BGUTIL_SERVER_PATH || '';
+const BGUTIL_BASE_URL = process.env.BGUTIL_BASE_URL || 'http://127.0.0.1:4416';
 
 function checkAuth(req, res, next) {
   if (!API_KEY) return next();
@@ -42,20 +53,7 @@ app.post('/extract', checkAuth, (req, res) => {
     return res.status(400).json({ error: 'url is required' });
   }
 
-  const args = [
-    '--dump-json',
-    '--no-warnings',
-    '--no-playlist',
-    '--no-check-certificates',
-    '--socket-timeout', '20',
-    // Photo-only posts (no video track — common on Instagram/Facebook)
-    // would otherwise make yt-dlp hard-error with "There is no video in
-    // this post" and print nothing. This flag makes it still dump the
-    // metadata JSON (title/thumbnail/etc.) with an empty `formats` list,
-    // which we turn into a downloadable "photo" format below.
-    '--ignore-no-formats-error',
-    url,
-  ];
+  const args = ytdlpArgs(url);
 
   execFile(
     YTDLP_PATH,
@@ -138,6 +136,55 @@ app.post('/extract', checkAuth, (req, res) => {
 
 function isYoutubeUrl(url) {
   return /(?:youtube\.com|youtu\.be)/i.test(url);
+}
+
+// Builds the yt-dlp argument list for a given URL. Split out from the
+// /extract handler so the PO Token plumbing (see the Dockerfile and the
+// constants above) lives in one place instead of being duplicated anywhere
+// else yt-dlp gets invoked.
+function ytdlpArgs(url) {
+  const args = [
+    '--dump-json',
+    '--no-warnings',
+    '--no-playlist',
+    '--no-check-certificates',
+    '--socket-timeout', '20',
+    // Photo-only posts (no video track — common on Instagram/Facebook)
+    // would otherwise make yt-dlp hard-error with "There is no video in
+    // this post" and print nothing. This flag makes it still dump the
+    // metadata JSON (title/thumbnail/etc.) with an empty `formats` list,
+    // which we turn into a downloadable "photo" format below.
+    '--ignore-no-formats-error',
+  ];
+  if (YTDLP_PLUGIN_DIRS) {
+    args.push('--plugin-dirs', YTDLP_PLUGIN_DIRS);
+  }
+  if (isYoutubeUrl(url) && YTDLP_PLUGIN_DIRS) {
+    args.push('--extractor-args', `youtubepot-bgutilhttp:base_url=${BGUTIL_BASE_URL}`);
+  }
+  args.push(url);
+  return args;
+}
+
+// Starts the local PO Token server the bgutil yt-dlp plugin talks to (see
+// the Dockerfile). It's a plain long-running Node process — if it dies,
+// YouTube extraction degrades back to failing with PO Token errors until
+// the next deploy/restart, rather than taking the rest of this server down
+// with it, so its exit is logged but not treated as fatal.
+function startBgutilPotServer() {
+  if (!BGUTIL_SERVER_PATH) {
+    console.log('[startup] BGUTIL_SERVER_PATH not set — skipping PO Token server (expected in local dev)');
+    return;
+  }
+  const proc = spawn('node', [BGUTIL_SERVER_PATH], { stdio: 'inherit' });
+  proc.on('exit', (code) => {
+    console.error(
+      `[startup] bgutil PO Token server exited (code ${code}) — YouTube extraction may start failing with PO Token errors until this service restarts.`
+    );
+  });
+  proc.on('error', (err) => {
+    console.error('[startup] failed to start bgutil PO Token server:', err.message);
+  });
 }
 
 // Independent fallback extractor for YouTube, used only when yt-dlp itself
@@ -250,6 +297,7 @@ function selfUpdateYtdlp() {
 }
 
 selfUpdateYtdlp();
+startBgutilPotServer();
 
 app.listen(PORT, () => {
   console.log(`Arak extraction server listening on port ${PORT}`);
