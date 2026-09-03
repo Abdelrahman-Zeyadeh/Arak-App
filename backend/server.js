@@ -169,6 +169,26 @@ async function tryExtractInstagramPhoto(url) {
   }
 }
 
+// YouTube changes its player/signature internals often enough that a
+// yt-dlp binary baked into the Docker image at build time can go stale
+// within days — this server keeps running for weeks between deploys (Render
+// free tier just spins the same container up/down on inactivity, it
+// doesn't rebuild), so a build-time-only yt-dlp silently rots and every
+// extraction starts failing with "Failed to extract any player response"
+// until someone happens to redeploy. Self-updating on every boot means each
+// cold start is also a chance to pick up a yt-dlp fix, no redeploy needed.
+function selfUpdateYtdlp() {
+  execFile(YTDLP_PATH, ['-U'], { timeout: 30000 }, (error, stdout, stderr) => {
+    if (error) {
+      console.error('[startup] yt-dlp self-update failed (continuing with existing binary):', error.message);
+      return;
+    }
+    console.log('[startup] yt-dlp self-update:', stdout.trim() || stderr.trim());
+  });
+}
+
+selfUpdateYtdlp();
+
 app.listen(PORT, () => {
   console.log(`Arak extraction server listening on port ${PORT}`);
 });
