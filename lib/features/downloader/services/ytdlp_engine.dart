@@ -1,11 +1,13 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' as p;
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
+
 import '../models/download_format.dart';
 import '../models/video_metadata.dart';
 import 'backend_extraction_service.dart';
@@ -15,13 +17,15 @@ class YtDlpEngine {
   factory YtDlpEngine() => _instance;
   YtDlpEngine._internal();
 
-  final Dio _dio = Dio(BaseOptions(
-    connectTimeout: const Duration(seconds: 15),
-    receiveTimeout: const Duration(seconds: 30),
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    },
-  ));
+  final Dio _dio = Dio(
+    BaseOptions(
+      connectTimeout: const Duration(seconds: 15),
+      receiveTimeout: const Duration(seconds: 30),
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      },
+    ),
+  );
 
   String? _cachedBinaryPath;
   bool _isDownloadingEngine = false;
@@ -29,7 +33,9 @@ class YtDlpEngine {
   bool get _canExecuteSubprocesses =>
       Platform.isWindows || Platform.isMacOS || Platform.isLinux;
 
-  Future<String?> getBinaryPath({void Function(double progress)? onDownloadProgress}) async {
+  Future<String?> getBinaryPath({
+    void Function(double progress)? onDownloadProgress,
+  }) async {
     if (!_canExecuteSubprocesses) return null;
 
     if (_cachedBinaryPath != null && await File(_cachedBinaryPath!).exists()) {
@@ -40,7 +46,12 @@ class YtDlpEngine {
       final checkCmd = Platform.isWindows ? 'where' : 'which';
       final checkProcess = await Process.run(checkCmd, ['yt-dlp']);
       if (checkProcess.exitCode == 0) {
-        final path = checkProcess.stdout.toString().trim().split('\n').first.trim();
+        final path = checkProcess.stdout
+            .toString()
+            .trim()
+            .split('\n')
+            .first
+            .trim();
         if (path.isNotEmpty && await File(path).exists()) {
           _cachedBinaryPath = path;
           return path;
@@ -67,7 +78,9 @@ class YtDlpEngine {
     }
   }
 
-  Future<String?> downloadBinary({void Function(double progress)? onProgress}) async {
+  Future<String?> downloadBinary({
+    void Function(double progress)? onProgress,
+  }) async {
     if (!_canExecuteSubprocesses || _isDownloadingEngine) return null;
     _isDownloadingEngine = true;
 
@@ -81,14 +94,17 @@ class YtDlpEngine {
       final isWin = Platform.isWindows;
       final isMac = Platform.isMacOS;
 
-      String downloadUrl = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe';
+      String downloadUrl =
+          'https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp.exe';
       String targetFilename = 'yt-dlp.exe';
 
       if (isMac) {
-        downloadUrl = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos';
+        downloadUrl =
+            'https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp_macos';
         targetFilename = 'yt-dlp';
       } else if (Platform.isLinux) {
-        downloadUrl = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp';
+        downloadUrl =
+            'https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp';
         targetFilename = 'yt-dlp';
       }
 
@@ -129,57 +145,72 @@ class YtDlpEngine {
     if (ytId != null) {
       try {
         final yt = YoutubeExplode();
-        final video = await yt.videos.get(ytId);
-        final manifest = await yt.videos.streamsClient.getManifest(ytId);
+        final video = await yt.videos.get(ytId).timeout(const Duration(seconds: 4));
+        final manifest = await yt.videos.streamsClient.getManifest(ytId).timeout(const Duration(seconds: 5));
         yt.close();
 
         final List<DownloadFormat> formats = [];
 
         for (final muxed in manifest.muxed.sortByVideoQuality()) {
           final res = muxed.qualityLabel;
-          final sizeMb = (muxed.size.totalBytes / (1024 * 1024)).toStringAsFixed(1);
-          formats.add(DownloadFormat(
-            formatId: muxed.tag.toString(),
-            ext: muxed.container.name,
-            resolution: res,
-            note: '$res ($sizeMb MB)',
-            filesize: muxed.size.totalBytes,
-            hasVideo: true,
-            hasAudio: true,
-          ));
+          final sizeMb = (muxed.size.totalBytes / (1024 * 1024))
+              .toStringAsFixed(1);
+          formats.add(
+            DownloadFormat(
+              formatId: muxed.tag.toString(),
+              ext: muxed.container.name,
+              resolution: res,
+              note: '$res ($sizeMb MB)',
+              filesize: muxed.size.totalBytes,
+              hasVideo: true,
+              hasAudio: true,
+            ),
+          );
         }
 
-        for (final vOnly in manifest.videoOnly.sortByVideoQuality()) {
-          if (!formats.any((f) => f.resolution == vOnly.qualityLabel)) {
-            final res = vOnly.qualityLabel;
-            final sizeMb = (vOnly.size.totalBytes / (1024 * 1024)).toStringAsFixed(1);
-            formats.add(DownloadFormat(
-              formatId: vOnly.tag.toString(),
-              ext: vOnly.container.name,
-              resolution: res,
-              note: '$res Video ($sizeMb MB)',
-              filesize: vOnly.size.totalBytes,
-              hasVideo: true,
-              hasAudio: false,
-            ));
+        // Only include videoOnly streams if a system ffmpeg is available to merge audio,
+        // otherwise only offer muxed formats (video+audio) so the downloaded file NEVER lacks sound!
+        final ffmpeg = await _findFfmpeg();
+        if (ffmpeg != null) {
+          for (final vOnly in manifest.videoOnly.sortByVideoQuality()) {
+            if (!formats.any((f) => f.resolution == vOnly.qualityLabel)) {
+              final res = vOnly.qualityLabel;
+              final sizeMb = (vOnly.size.totalBytes / (1024 * 1024)).toStringAsFixed(1);
+              formats.add(
+                DownloadFormat(
+                  formatId: vOnly.tag.toString(),
+                  ext: vOnly.container.name,
+                  resolution: res,
+                  note: '$res ($sizeMb MB)',
+                  filesize: vOnly.size.totalBytes,
+                  hasVideo: true,
+                  hasAudio: false,
+                ),
+              );
+            }
           }
         }
 
         for (final audio in manifest.audioOnly.sortByBitrate()) {
           final bitrateKbps = (audio.bitrate.kiloBitsPerSecond).round();
-          final sizeMb = (audio.size.totalBytes / (1024 * 1024)).toStringAsFixed(1);
-          final ext = audio.container.name == 'mp4' ? 'm4a' : audio.container.name;
-          formats.add(DownloadFormat(
-            formatId: audio.tag.toString(),
-            ext: ext,
-            resolution: 'Audio $bitrateKbps kbps',
-            note: '${ext.toUpperCase()} $bitrateKbps kbps ($sizeMb MB)',
-            filesize: audio.size.totalBytes,
-            isAudioOnly: true,
-            hasVideo: false,
-            hasAudio: true,
-            abr: bitrateKbps,
-          ));
+          final sizeMb = (audio.size.totalBytes / (1024 * 1024))
+              .toStringAsFixed(1);
+          final ext = audio.container.name == 'mp4'
+              ? 'm4a'
+              : audio.container.name;
+          formats.add(
+            DownloadFormat(
+              formatId: audio.tag.toString(),
+              ext: ext,
+              resolution: 'Audio $bitrateKbps kbps',
+              note: '${ext.toUpperCase()} $bitrateKbps kbps ($sizeMb MB)',
+              filesize: audio.size.totalBytes,
+              isAudioOnly: true,
+              hasVideo: false,
+              hasAudio: true,
+              abr: bitrateKbps,
+            ),
+          );
         }
 
         if (formats.isNotEmpty) {
@@ -202,13 +233,18 @@ class YtDlpEngine {
       final bin = await getBinaryPath();
       if (bin != null) {
         try {
-          final result = await Process.run(
-            bin,
-            ['--dump-json', '--no-warnings', '--no-playlist', url],
-          );
+          final result = await Process.run(bin, [
+            '--dump-json',
+            '--no-warnings',
+            '--no-playlist',
+            url,
+          ]);
 
-          if (result.exitCode == 0 && result.stdout.toString().trim().isNotEmpty) {
-            final Map<String, dynamic> json = jsonDecode(result.stdout.toString().trim());
+          if (result.exitCode == 0 &&
+              result.stdout.toString().trim().isNotEmpty) {
+            final Map<String, dynamic> json = jsonDecode(
+              result.stdout.toString().trim(),
+            );
             return VideoMetadata.fromYtDlpJson(json);
           }
         } catch (e) {
@@ -231,12 +267,15 @@ class YtDlpEngine {
       if (backendResult != null && backendResult.formats.isNotEmpty) {
         return backendResult;
       }
-      debugPrint('[YtDlpEngine] Backend extraction returned nothing, falling back to on-device scraping.');
+      debugPrint(
+        '[YtDlpEngine] Backend extraction returned nothing, falling back to on-device scraping.',
+      );
     }
 
     String title = 'Social Media Video';
     String author = 'Creator';
-    String thumbnail = 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=600&auto=format&fit=crop&q=60';
+    String thumbnail =
+        'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=600&auto=format&fit=crop&q=60';
     int duration = 0;
     final cleanUrl = url.trim();
 
@@ -246,7 +285,8 @@ class YtDlpEngine {
 
     // 1. Instagram
     if (cleanUrl.contains('instagram.com') || cleanUrl.contains('instagr.am')) {
-      final match = RegExp(r'(?:reel|reels|p|tv)\/([a-zA-Z0-9_-]+)').firstMatch(cleanUrl);
+      final match = RegExp(r'(?:reel|reels|p|tv)\/([a-zA-Z0-9_-]+)')
+          .firstMatch(cleanUrl);
       final code = match?.group(1) ?? 'reel';
       title = 'Instagram Reel ($code)';
       author = 'Instagram Creator';
@@ -265,7 +305,9 @@ class YtDlpEngine {
       thumbnail = 'https://images.unsplash.com/photo-1596558450255-7c0b7be9d56a?w=600&auto=format&fit=crop&q=60';
 
       try {
-        final res = await _dio.get('https://www.tiktok.com/oembed?url=${Uri.encodeComponent(cleanUrl)}');
+        final res = await _dio.get(
+          'https://www.tiktok.com/oembed?url=${Uri.encodeComponent(cleanUrl)}',
+        );
         if (res.statusCode == 200 && res.data is Map) {
           title = res.data['title'] ?? title;
           author = res.data['author_name'] ?? author;
@@ -292,7 +334,9 @@ class YtDlpEngine {
       }
     }
     // 3. Facebook
-    else if (cleanUrl.contains('facebook.com') || cleanUrl.contains('fb.watch') || cleanUrl.contains('fb.com')) {
+    else if (cleanUrl.contains('facebook.com') ||
+        cleanUrl.contains('fb.watch') ||
+        cleanUrl.contains('fb.com')) {
       title = 'Facebook Video';
       author = 'Facebook User';
       thumbnail = 'https://images.unsplash.com/photo-1563986768609-322da13575f3?w=600&auto=format&fit=crop&q=60';
@@ -323,7 +367,9 @@ class YtDlpEngine {
     // 5. Vimeo
     else if (cleanUrl.contains('vimeo.com')) {
       try {
-        final res = await _dio.get('https://vimeo.com/api/oembed.json?url=$cleanUrl');
+        final res = await _dio.get(
+          'https://vimeo.com/api/oembed.json?url=$cleanUrl',
+        );
         if (res.statusCode == 200 && res.data is Map) {
           title = res.data['title'] ?? title;
           author = res.data['author_name'] ?? author;
@@ -338,70 +384,84 @@ class YtDlpEngine {
     final List<DownloadFormat> formats = [];
 
     if (directHdUrl != null && directHdUrl.isNotEmpty) {
-      formats.add(DownloadFormat(
-        formatId: 'hd',
-        ext: 'mp4',
-        resolution: 'HD (Best Quality)',
-        note: 'High Definition (MP4)',
-        directUrl: directHdUrl,
-        hasVideo: true,
-        hasAudio: true,
-      ));
+      formats.add(
+        DownloadFormat(
+          formatId: 'hd',
+          ext: 'mp4',
+          resolution: 'HD (Best Quality)',
+          note: 'High Definition (MP4)',
+          directUrl: directHdUrl,
+          hasVideo: true,
+          hasAudio: true,
+        ),
+      );
     } else {
-      formats.add(const DownloadFormat(
-        formatId: 'hd',
-        ext: 'mp4',
-        resolution: 'HD (Best Quality)',
-        note: 'High Definition (MP4)',
-        hasVideo: true,
-        hasAudio: true,
-      ));
+      formats.add(
+        const DownloadFormat(
+          formatId: 'hd',
+          ext: 'mp4',
+          resolution: 'HD (Best Quality)',
+          note: 'High Definition (MP4)',
+          hasVideo: true,
+          hasAudio: true,
+        ),
+      );
     }
 
-    if (directSdUrl != null && directSdUrl.isNotEmpty && directSdUrl != directHdUrl) {
-      formats.add(DownloadFormat(
-        formatId: 'sd',
-        ext: 'mp4',
-        resolution: 'SD (Standard)',
-        note: 'Standard Quality (MP4)',
-        directUrl: directSdUrl,
-        hasVideo: true,
-        hasAudio: true,
-      ));
+    if (directSdUrl != null &&
+        directSdUrl.isNotEmpty &&
+        directSdUrl != directHdUrl) {
+      formats.add(
+        DownloadFormat(
+          formatId: 'sd',
+          ext: 'mp4',
+          resolution: 'SD (Standard)',
+          note: 'Standard Quality (MP4)',
+          directUrl: directSdUrl,
+          hasVideo: true,
+          hasAudio: true,
+        ),
+      );
     } else if (directHdUrl == null) {
-      formats.add(const DownloadFormat(
-        formatId: 'sd',
-        ext: 'mp4',
-        resolution: 'SD (Standard)',
-        note: 'Standard Quality (MP4)',
-        hasVideo: true,
-        hasAudio: true,
-      ));
+      formats.add(
+        const DownloadFormat(
+          formatId: 'sd',
+          ext: 'mp4',
+          resolution: 'SD (Standard)',
+          note: 'Standard Quality (MP4)',
+          hasVideo: true,
+          hasAudio: true,
+        ),
+      );
     }
 
     if (directAudioUrl != null && directAudioUrl.isNotEmpty) {
-      formats.add(DownloadFormat(
-        formatId: 'audio',
-        ext: 'mp3',
-        resolution: 'Audio (MP3)',
-        note: 'Audio Only (MP3)',
-        directUrl: directAudioUrl,
-        isAudioOnly: true,
-        hasVideo: false,
-        hasAudio: true,
-        abr: 128,
-      ));
+      formats.add(
+        DownloadFormat(
+          formatId: 'audio',
+          ext: 'mp3',
+          resolution: 'Audio (MP3)',
+          note: 'Audio Only (MP3)',
+          directUrl: directAudioUrl,
+          isAudioOnly: true,
+          hasVideo: false,
+          hasAudio: true,
+          abr: 128,
+        ),
+      );
     } else {
-      formats.add(const DownloadFormat(
-        formatId: 'audio',
-        ext: 'mp3',
-        resolution: 'Audio (MP3)',
-        note: 'Audio Only (MP3)',
-        isAudioOnly: true,
-        hasVideo: false,
-        hasAudio: true,
-        abr: 128,
-      ));
+      formats.add(
+        const DownloadFormat(
+          formatId: 'audio',
+          ext: 'mp3',
+          resolution: 'Audio (MP3)',
+          note: 'Audio Only (MP3)',
+          isAudioOnly: true,
+          hasVideo: false,
+          hasAudio: true,
+          abr: 128,
+        ),
+      );
     }
 
     return VideoMetadata(
@@ -420,6 +480,7 @@ class YtDlpEngine {
     required DownloadFormat format,
     required String outputDir,
     String? customFilename,
+    bool resume = false,
   }) {
     final ytId = _extractYouTubeId(url);
 
@@ -429,6 +490,7 @@ class YtDlpEngine {
         format: format,
         outputDir: outputDir,
         customFilename: customFilename,
+        resume: resume,
       );
     }
 
@@ -439,6 +501,7 @@ class YtDlpEngine {
         format: format,
         outputDir: outputDir,
         customFilename: customFilename,
+        resume: resume,
       );
     }
 
@@ -456,6 +519,7 @@ class YtDlpEngine {
       format: format,
       outputDir: outputDir,
       customFilename: customFilename,
+      resume: resume,
     );
   }
 
@@ -464,6 +528,7 @@ class YtDlpEngine {
     required DownloadFormat format,
     required String outputDir,
     String? customFilename,
+    bool resume = false,
   }) {
     final controller = StreamController<Map<String, dynamic>>();
 
@@ -488,106 +553,139 @@ class YtDlpEngine {
 
         StreamInfo? streamInfo;
         String ext = 'mp4';
+        AudioOnlyStreamInfo? audioStream;
+        String? ffmpegPath;
 
         if (format.isAudioOnly) {
           if (manifest.audioOnly.isNotEmpty) {
             streamInfo = manifest.audioOnly.withHighestBitrate();
-            ext = streamInfo.container.name == 'mp4' ? 'm4a' : streamInfo.container.name;
+            ext = streamInfo.container.name == 'mp4'
+                ? 'm4a'
+                : streamInfo.container.name;
           } else if (manifest.muxed.isNotEmpty) {
             streamInfo = manifest.muxed.first;
             ext = 'mp4';
           }
         } else {
           final tagId = int.tryParse(format.formatId);
-          if (tagId != null && manifest.streams.any((s) => s.tag == tagId)) {
-            streamInfo = manifest.streams.firstWhere((s) => s.tag == tagId);
+          // Prefer muxed (video+audio) stream if requested format is muxed or on mobile where ffmpeg is not installed
+          final isMuxedTag = tagId != null && manifest.muxed.any((s) => s.tag == tagId);
+          if (isMuxedTag) {
+            streamInfo = manifest.muxed.firstWhere((s) => s.tag == tagId);
           } else {
+            // Find best matching muxed stream first so video ALWAYS has sound!
             final cleanRes = format.resolution.replaceAll(RegExp(r'[^0-9]'), '');
-            final matching = manifest.muxed.where((s) => s.qualityLabel.contains(cleanRes));
-            if (matching.isNotEmpty) {
-              streamInfo = matching.first;
-            } else if (manifest.muxed.isNotEmpty) {
-              streamInfo = manifest.muxed.sortByVideoQuality().last;
-            } else if (manifest.videoOnly.isNotEmpty) {
-              streamInfo = manifest.videoOnly.sortByVideoQuality().last;
+            final matchingMuxed = manifest.muxed.where((s) => s.qualityLabel.contains(cleanRes));
+            
+            if (matchingMuxed.isNotEmpty) {
+              streamInfo = matchingMuxed.first;
             } else {
-              streamInfo = manifest.streams.first;
+              // If videoOnly was selected, check if ffmpeg is available to merge audio
+              ffmpegPath = await _findFfmpeg();
+              if (ffmpegPath != null && manifest.audioOnly.isNotEmpty) {
+                if (tagId != null && manifest.videoOnly.any((s) => s.tag == tagId)) {
+                  streamInfo = manifest.videoOnly.firstWhere((s) => s.tag == tagId);
+                } else {
+                  streamInfo = manifest.videoOnly.sortByVideoQuality().last;
+                }
+                audioStream = manifest.audioOnly.withHighestBitrate();
+              } else if (manifest.muxed.isNotEmpty) {
+                // Ffmpeg not available on device -> FALLBACK to highest quality muxed stream with AUDIO!
+                streamInfo = manifest.muxed.sortByVideoQuality().last;
+              } else if (manifest.videoOnly.isNotEmpty) {
+                streamInfo = manifest.videoOnly.sortByVideoQuality().last;
+              }
             }
           }
-          ext = streamInfo.container.name;
+          ext = streamInfo?.container.name ?? 'mp4';
         }
 
         if (streamInfo == null) {
           throw Exception('No stream available for selected quality');
         }
-        final validStream = streamInfo;
+        StreamInfo videoStream = streamInfo;
 
         final title = customFilename ?? video.title;
         final sanitizedTitle = title.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
         final targetFilePath = p.join(outputDir, '$sanitizedTitle.$ext');
         final targetFile = File(targetFilePath);
 
-        if (await targetFile.exists()) {
+        // Only wipe a pre-existing target when this is a fresh download —
+        // a resumed task needs whatever partial bytes are already on disk
+        // (in the .video.tmp/.audio.tmp temp files, or the target itself
+        // for a single-stream download) to actually resume from them.
+        if (!resume && await targetFile.exists()) {
           await targetFile.delete();
         }
 
-        final stream = yt.videos.streamsClient.get(validStream);
-        final outputSink = targetFile.openWrite();
-
-        final totalBytes = validStream.size.totalBytes;
-        int receivedBytes = 0;
-        final startTime = DateTime.now();
-        DateTime lastTime = DateTime.now();
-        int lastBytes = 0;
-        String currentSpeed = '0 KB/s';
-
-        await for (final chunk in stream) {
-          outputSink.add(chunk);
-          receivedBytes += chunk.length;
-
-          final now = DateTime.now();
-          final elapsedSec = now.difference(lastTime).inMilliseconds / 1000.0;
-
-          if (elapsedSec >= 0.4 && totalBytes > 0) {
-            final bytesDiff = receivedBytes - lastBytes;
-            final speedBps = bytesDiff / (elapsedSec > 0 ? elapsedSec : 1.0);
-            if (speedBps > 1024 * 1024) {
-              currentSpeed = '${(speedBps / (1024 * 1024)).toStringAsFixed(1)} MB/s';
-            } else {
-              currentSpeed = '${(speedBps / 1024).toStringAsFixed(0)} KB/s';
-            }
-            lastBytes = receivedBytes;
-            lastTime = now;
-
-            final progress = (receivedBytes / totalBytes).clamp(0.0, 1.0);
-            final remainingBytes = totalBytes - receivedBytes;
-            final totalElapsed = now.difference(startTime).inSeconds;
-            final avgSpeed = totalElapsed > 0 ? receivedBytes / totalElapsed : 1.0;
-            final remainingSec = avgSpeed > 0 ? (remainingBytes / avgSpeed).round() : 0;
-            final etaStr = '${(remainingSec ~/ 60)}:${(remainingSec % 60).toString().padLeft(2, '0')}';
-
-            final totalMb = (totalBytes / (1024 * 1024)).toStringAsFixed(1);
-            final percentInt = (progress * 100).toInt();
+        if (audioStream != null && ffmpegPath != null) {
+          final videoTemp = File('$targetFilePath.video.tmp');
+          final audioTemp = File('$targetFilePath.audio.tmp');
+          try {
+            await _downloadYtStreamToFile(
+              yt,
+              videoStream,
+              videoTemp,
+              progressStart: 0.0,
+              progressEnd: 0.6,
+              emit: controller.add,
+              resume: resume,
+            );
+            await _downloadYtStreamToFile(
+              yt,
+              audioStream,
+              audioTemp,
+              progressStart: 0.6,
+              progressEnd: 0.9,
+              emit: controller.add,
+              resume: resume,
+            );
 
             controller.add({
               'type': 'progress',
-              'progress': progress,
-              'percentageStr': '$percentInt%',
-              'totalSizeStr': '$totalMb MB',
-              'speed': currentSpeed,
-              'eta': etaStr,
+              'progress': 0.95,
+              'percentageStr': '95%',
+              'speed': 'Merging audio & video...',
+              'eta': '...',
             });
+
+            final mergeResult = await Process.run(ffmpegPath, [
+              '-y',
+              '-i',
+              videoTemp.path,
+              '-i',
+              audioTemp.path,
+              '-c',
+              'copy',
+              '-map',
+              '0:v:0',
+              '-map',
+              '1:a:0',
+              targetFilePath,
+            ]);
+
+            if (mergeResult.exitCode != 0 || !await targetFile.exists()) {
+              throw Exception('ffmpeg merge failed: ${mergeResult.stderr}');
+            }
+          } finally {
+            if (await videoTemp.exists()) await videoTemp.delete();
+            if (await audioTemp.exists()) await audioTemp.delete();
           }
+        } else {
+          await _downloadYtStreamToFile(
+            yt,
+            videoStream,
+            targetFile,
+            progressStart: 0.0,
+            progressEnd: 0.95,
+            emit: controller.add,
+            resume: resume,
+          );
         }
 
-        await outputSink.flush();
-        await outputSink.close();
         yt.close();
 
-        controller.add({
-          'type': 'completed',
-          'filePath': targetFilePath,
-        });
+        controller.add({'type': 'completed', 'filePath': targetFilePath});
         await controller.close();
       } catch (e) {
         try {
@@ -596,22 +694,182 @@ class YtDlpEngine {
             format: format,
             outputDir: outputDir,
             customFilename: customFilename,
+            resume: resume,
           );
           await for (final event in fallbackStream) {
             controller.add(event);
           }
           await controller.close();
         } catch (fallbackError) {
-          controller.add({
-            'type': 'error',
-            'message': 'Download failed: $e',
-          });
+          controller.add({'type': 'error', 'message': 'Download failed: $e'});
           await controller.close();
         }
       }
     }();
 
     return controller.stream;
+  }
+
+  /// Downloads a single YouTube stream to [targetFile], reporting progress
+  /// mapped into the [progressStart, progressEnd] slice of the overall bar
+  /// (used to blend two sequential downloads — video then audio — into one
+  /// continuous progress report).
+  ///
+  /// When [resume] is true and [targetFile] already has partial bytes on
+  /// disk from an earlier attempt, continues from that byte offset via a
+  /// ranged HTTP request instead of re-downloading the whole stream.
+  Future<void> _downloadYtStreamToFile(
+    YoutubeExplode yt,
+    StreamInfo streamInfo,
+    File targetFile, {
+    required double progressStart,
+    required double progressEnd,
+    required void Function(Map<String, dynamic> event) emit,
+    bool resume = false,
+  }) async {
+    final totalBytes = streamInfo.size.totalBytes;
+    int existingBytes = 0;
+    if (resume && await targetFile.exists()) {
+      existingBytes = await targetFile.length();
+    }
+    // Already fully downloaded (or a corrupt/oversized leftover) — nothing
+    // left to fetch for this stream.
+    if (totalBytes > 0 && existingBytes >= totalBytes) {
+      emit({
+        'type': 'progress',
+        'progress': progressEnd,
+        'percentageStr': '${(progressEnd * 100).toInt()}%',
+        'speed': '',
+        'eta': '0:00',
+      });
+      return;
+    }
+
+    var isResuming = existingBytes > 0;
+    Stream<List<int>> chunks;
+    IOSink sink;
+    if (isResuming) {
+      // The signed stream URL may have expired, or the CDN may not honor
+      // the Range header — in either case fall back to a clean re-download
+      // of this stream rather than abandoning the whole download.
+      try {
+        chunks = await _resumableYtByteStream(streamInfo, startByte: existingBytes);
+        sink = targetFile.openWrite(mode: FileMode.append);
+      } catch (_) {
+        isResuming = false;
+        existingBytes = 0;
+        chunks = yt.videos.streamsClient.get(streamInfo);
+        sink = targetFile.openWrite();
+      }
+    } else {
+      chunks = yt.videos.streamsClient.get(streamInfo);
+      sink = targetFile.openWrite();
+    }
+
+    int receivedBytes = existingBytes;
+    final startTime = DateTime.now();
+    DateTime lastTime = DateTime.now();
+    int lastBytes = existingBytes;
+    String currentSpeed = '0 KB/s';
+
+    await for (final chunk in chunks) {
+      sink.add(chunk);
+      receivedBytes += chunk.length;
+
+      final now = DateTime.now();
+      final elapsedSec = now.difference(lastTime).inMilliseconds / 1000.0;
+
+      if (elapsedSec >= 0.4 && totalBytes > 0) {
+        final bytesDiff = receivedBytes - lastBytes;
+        final speedBps = bytesDiff / (elapsedSec > 0 ? elapsedSec : 1.0);
+        currentSpeed = speedBps > 1024 * 1024
+            ? '${(speedBps / (1024 * 1024)).toStringAsFixed(1)} MB/s'
+            : '${(speedBps / 1024).toStringAsFixed(0)} KB/s';
+        lastBytes = receivedBytes;
+        lastTime = now;
+
+        final localProgress = (receivedBytes / totalBytes).clamp(0.0, 1.0);
+        final overallProgress =
+            progressStart + localProgress * (progressEnd - progressStart);
+        final remainingBytes = totalBytes - receivedBytes;
+        final totalElapsedSec = now.difference(startTime).inSeconds;
+        final avgSpeed = totalElapsedSec > 0
+            ? receivedBytes / totalElapsedSec
+            : 1.0;
+        final remainingSec = avgSpeed > 0
+            ? (remainingBytes / avgSpeed).round()
+            : 0;
+        final etaStr =
+            '${remainingSec ~/ 60}:${(remainingSec % 60).toString().padLeft(2, '0')}';
+        final totalMb = (totalBytes / (1024 * 1024)).toStringAsFixed(1);
+        final percentInt = (overallProgress * 100).toInt();
+
+        emit({
+          'type': 'progress',
+          'progress': overallProgress,
+          'percentageStr': '$percentInt%',
+          'totalSizeStr': '$totalMb MB',
+          'speed': currentSpeed,
+          'eta': etaStr,
+        });
+      }
+    }
+
+    await sink.flush();
+    await sink.close();
+  }
+
+  /// Fetches the remainder of a YouTube CDN stream starting at [startByte],
+  /// mirroring the ranged-request trick youtube_explode_dart uses
+  /// internally (which isn't exposed on its public API) so an interrupted
+  /// download can resume instead of restarting from zero. Throws if the
+  /// request itself fails or the server doesn't honor the range — callers
+  /// should fall back to a fresh download in that case.
+  Future<Stream<List<int>>> _resumableYtByteStream(
+    StreamInfo streamInfo, {
+    required int startByte,
+  }) async {
+    final total = streamInfo.size.totalBytes;
+    final rangeValue = 'bytes=$startByte-${total > 0 ? total - 1 : ''}';
+    final response = await _dio.get<ResponseBody>(
+      streamInfo.url.toString(),
+      options: Options(
+        responseType: ResponseType.stream,
+        headers: {'Range': rangeValue},
+        validateStatus: (s) => s != null && s < 500,
+      ),
+    );
+
+    final body = response.data;
+    if (body == null || (response.statusCode ?? 0) >= 400) {
+      throw Exception('Resume request failed with status ${response.statusCode}');
+    }
+    // Server ignored the Range header and is sending the whole file again —
+    // signal callers can't trust this as an append-only continuation.
+    if (response.statusCode != 206) {
+      throw Exception('Server did not honor range request (resume unsupported)');
+    }
+
+    return body.stream;
+  }
+
+  /// Locates a system-installed ffmpeg on PATH (not bundled with the app).
+  /// Used only to mux a separately-downloaded video-only + audio-only pair
+  /// for YouTube qualities that have no muxed (video+audio) equivalent.
+  Future<String?> _findFfmpeg() async {
+    try {
+      final checkCmd = Platform.isWindows ? 'where' : 'which';
+      final result = await Process.run(checkCmd, ['ffmpeg']);
+      if (result.exitCode == 0) {
+        final path = result.stdout.toString().trim().split('\n').first.trim();
+        if (path.isNotEmpty && await File(path).exists()) {
+          return path;
+        }
+      }
+    } catch (e) {
+      debugPrint('[YtDlpEngine] ffmpeg not found on PATH: $e');
+    }
+    return null;
   }
 
   // ==========================================
@@ -627,7 +885,10 @@ class YtDlpEngine {
     final cleanUrl = rawUrl.trim();
 
     // 1. Direct media links (.mp4, .mp3, etc.)
-    if (cleanUrl.endsWith('.mp4') || cleanUrl.endsWith('.mp3') || cleanUrl.endsWith('.m4a') || cleanUrl.endsWith('.webm')) {
+    if (cleanUrl.endsWith('.mp4') ||
+        cleanUrl.endsWith('.mp3') ||
+        cleanUrl.endsWith('.m4a') ||
+        cleanUrl.endsWith('.webm')) {
       return cleanUrl;
     }
 
@@ -636,12 +897,18 @@ class YtDlpEngine {
     // this re-resolves a fresh one at actual download time rather than
     // relying only on the URL cached from the earlier probe step.
     if (BackendExtractionService().isConfigured) {
-      final backendUrl = await _resolveViaBackend(cleanUrl, isAudioOnly: isAudioOnly, formatId: formatId);
+      final backendUrl = await _resolveViaBackend(
+        cleanUrl,
+        isAudioOnly: isAudioOnly,
+        formatId: formatId,
+      );
       if (backendUrl != null) return backendUrl;
     }
 
     // 2. Facebook
-    if (cleanUrl.contains('facebook.com') || cleanUrl.contains('fb.watch') || cleanUrl.contains('fb.com')) {
+    if (cleanUrl.contains('facebook.com') ||
+        cleanUrl.contains('fb.watch') ||
+        cleanUrl.contains('fb.com')) {
       final fbStreams = await _resolveFacebookStreams(cleanUrl);
       if (fbStreams != null) {
         if (formatId == 'sd' && fbStreams['sd'] != null) return fbStreams['sd'];
@@ -676,7 +943,10 @@ class YtDlpEngine {
     }
 
     // 6. Reddit / Pinterest / Other Media
-    final other = await _resolveOtherMediaStream(cleanUrl, isAudioOnly: isAudioOnly);
+    final other = await _resolveOtherMediaStream(
+      cleanUrl,
+      isAudioOnly: isAudioOnly,
+    );
     if (other != null && other.isNotEmpty) return other;
 
     // 7. Global Cobalt Fallback (works for many platforms)
@@ -709,20 +979,31 @@ class YtDlpEngine {
 
   /// Resolves a direct stream URL via the self-hosted extraction backend,
   /// picking the best matching format from its yt-dlp response.
-  Future<String?> _resolveViaBackend(String url, {bool isAudioOnly = false, String? formatId}) async {
+  Future<String?> _resolveViaBackend(
+    String url, {
+    bool isAudioOnly = false,
+    String? formatId,
+  }) async {
     final meta = await BackendExtractionService().extract(url);
     if (meta == null || meta.formats.isEmpty) return null;
 
     if (isAudioOnly) {
-      final audioFormats = meta.formats.where((f) => f.isAudioOnly && f.directUrl != null).toList()
-        ..sort((a, b) => (b.abr ?? 0).compareTo(a.abr ?? 0));
+      final audioFormats =
+          meta.formats
+              .where((f) => f.isAudioOnly && f.directUrl != null)
+              .toList()
+            ..sort((a, b) => (b.abr ?? 0).compareTo(a.abr ?? 0));
       if (audioFormats.isNotEmpty) return audioFormats.first.directUrl;
     }
 
-    final videoFormats = meta.formats.where((f) => f.hasVideo && f.directUrl != null).toList();
+    final videoFormats = meta.formats
+        .where((f) => f.hasVideo && f.directUrl != null)
+        .toList();
     if (videoFormats.isEmpty) return null;
     videoFormats.sort((a, b) => _formatHeight(a).compareTo(_formatHeight(b)));
-    return formatId == 'sd' ? videoFormats.first.directUrl : videoFormats.last.directUrl;
+    return formatId == 'sd'
+        ? videoFormats.first.directUrl
+        : videoFormats.last.directUrl;
   }
 
   int _formatHeight(DownloadFormat f) {
@@ -750,12 +1031,18 @@ class YtDlpEngine {
       String? title;
       String? thumbnail;
 
-      final hdMatch = RegExp(r'playable_url_quality_hd["\\]*:\s*["\\]*(https:[^"\\]+)').firstMatch(body) ??
-          RegExp(r'browser_native_hd_url["\\]*:\s*["\\]*(https:[^"\\]+)').firstMatch(body) ??
+      final hdMatch =
+          RegExp(r'playable_url_quality_hd["\\]*:\s*["\\]*(https:[^"\\]+)')
+              .firstMatch(body) ??
+          RegExp(r'browser_native_hd_url["\\]*:\s*["\\]*(https:[^"\\]+)')
+              .firstMatch(body) ??
           RegExp(r'hd_src["\\]*:\s*["\\]*(https:[^"\\]+)').firstMatch(body);
 
-      final sdMatch = RegExp(r'playable_url["\\]*:\s*["\\]*(https:[^"\\]+)').firstMatch(body) ??
-          RegExp(r'browser_native_sd_url["\\]*:\s*["\\]*(https:[^"\\]+)').firstMatch(body) ??
+      final sdMatch =
+          RegExp(r'playable_url["\\]*:\s*["\\]*(https:[^"\\]+)')
+              .firstMatch(body) ??
+          RegExp(r'browser_native_sd_url["\\]*:\s*["\\]*(https:[^"\\]+)')
+              .firstMatch(body) ??
           RegExp(r'sd_src["\\]*:\s*["\\]*(https:[^"\\]+)').firstMatch(body);
 
       if (hdMatch != null) {
@@ -766,20 +1053,27 @@ class YtDlpEngine {
       }
 
       // Title & Thumbnail
-      final titleMatch = RegExp(r'<title id="pageTitle">([^<]+)<\/title>').firstMatch(body) ??
+      final titleMatch =
+          RegExp(r'<title id="pageTitle">([^<]+)<\/title>').firstMatch(body) ??
           RegExp(r'property="og:title"\s+content="([^"]+)"').firstMatch(body);
       if (titleMatch != null) title = titleMatch.group(1);
 
-      final thumbMatch = RegExp(r'property="og:image"\s+content="([^"]+)"').firstMatch(body);
+      final thumbMatch = RegExp(r'property="og:image"\s+content="([^"]+)"')
+          .firstMatch(body);
       if (thumbMatch != null) thumbnail = _cleanStreamUrl(thumbMatch.group(1)!);
 
       // Fallback: search for any fbcdn .mp4
       if (hdUrl == null && sdUrl == null) {
-        final allMp4s = RegExp(r'https:[^"\s<>]+\.mp4[^"\s<>]*').allMatches(body);
+        final allMp4s = RegExp(r'https:[^"\s<>]+\.mp4[^"\s<>]*')
+            .allMatches(body);
         for (final m in allMp4s) {
           final candidate = _cleanStreamUrl(m.group(0)!);
-          if (candidate.contains('fbcdn.net') && !candidate.contains('.js') && !candidate.contains('.css')) {
-            if (candidate.contains('hd') || candidate.contains('1280') || candidate.contains('720')) {
+          if (candidate.contains('fbcdn.net') &&
+              !candidate.contains('.js') &&
+              !candidate.contains('.css')) {
+            if (candidate.contains('hd') ||
+                candidate.contains('1280') ||
+                candidate.contains('720')) {
               hdUrl ??= candidate;
             } else {
               sdUrl ??= candidate;
@@ -804,7 +1098,12 @@ class YtDlpEngine {
     try {
       final fRes = await _dio.post(
         'https://v3.fdownloader.net/api/ajaxSearch',
-        data: FormData.fromMap({'q': url, 't': 'media', 'lang': 'en', 'v': 'v2'}),
+        data: FormData.fromMap({
+          'q': url,
+          't': 'media',
+          'lang': 'en',
+          'v': 'v2',
+        }),
         options: Options(
           headers: {
             'Origin': 'https://fdownloader.net',
@@ -815,7 +1114,8 @@ class YtDlpEngine {
       );
       if (fRes.statusCode == 200 && fRes.data is Map) {
         final html = fRes.data['data']?.toString() ?? '';
-        final hrefs = RegExp(r'href="(https:\/\/[^"]+(?:fbcdn|video)[^"]*)"').allMatches(html);
+        final hrefs = RegExp(r'href="(https:\/\/[^"]+(?:fbcdn|video)[^"]*)"')
+            .allMatches(html);
         if (hrefs.isNotEmpty) {
           return {'hd': hrefs.first.group(1)!, 'sd': hrefs.last.group(1)!};
         }
@@ -848,9 +1148,15 @@ class YtDlpEngine {
         String? hdplay = d['hdplay']?.toString();
         String? music = d['music']?.toString();
 
-        if (play != null && play.startsWith('/')) play = 'https://www.tikwm.com$play';
-        if (hdplay != null && hdplay.startsWith('/')) hdplay = 'https://www.tikwm.com$hdplay';
-        if (music != null && music.startsWith('/')) music = 'https://www.tikwm.com$music';
+        if (play != null && play.startsWith('/')) {
+          play = 'https://www.tikwm.com$play';
+        }
+        if (hdplay != null && hdplay.startsWith('/')) {
+          hdplay = 'https://www.tikwm.com$hdplay';
+        }
+        if (music != null && music.startsWith('/')) {
+          music = 'https://www.tikwm.com$music';
+        }
 
         if (play != null && play.isNotEmpty) {
           final resMap = <String, String>{'play': play};
@@ -894,7 +1200,12 @@ class YtDlpEngine {
       final res = await _dio.post(
         'https://api.tikmate.app/api/lookup',
         data: FormData.fromMap({'url': url}),
-        options: Options(headers: {'Origin': 'https://tikmate.app', 'Referer': 'https://tikmate.app/'}),
+        options: Options(
+          headers: {
+            'Origin': 'https://tikmate.app',
+            'Referer': 'https://tikmate.app/',
+          },
+        ),
       );
       if (res.statusCode == 200 && res.data is Map) {
         final token = res.data['token'];
@@ -915,7 +1226,9 @@ class YtDlpEngine {
   Future<Map<String, String>?> _resolveTwitterStreams(String url) async {
     // Engine A: VxTwitter / FxTwitter API (most reliable)
     try {
-      final match = RegExp(r'(?:twitter\.com|x\.com)\/(?:#!\/)?(\w+)\/status(?:es)?\/(\d+)').firstMatch(url);
+      final match = RegExp(
+        r'(?:twitter\.com|x\.com)\/(?:#!\/)?(\w+)\/status(?:es)?\/(\d+)',
+      ).firstMatch(url);
       final user = match?.group(1) ?? 'i';
       final id = match?.group(2);
       if (id != null) {
@@ -941,7 +1254,8 @@ class YtDlpEngine {
                   return {
                     'hd': urlStr,
                     'sd': urlStr,
-                    if (tweet['text'] != null) 'title': tweet['text'].toString(),
+                    if (tweet['text'] != null)
+                      'title': tweet['text'].toString(),
                   };
                 }
               }
@@ -953,9 +1267,7 @@ class YtDlpEngine {
         try {
           final vx = await _dio.get(
             'https://api.vxtwitter.com/$user/status/$id',
-            options: Options(
-              headers: {'User-Agent': 'Mozilla/5.0'},
-            ),
+            options: Options(headers: {'User-Agent': 'Mozilla/5.0'}),
           );
           if (vx.statusCode == 200 && vx.data is Map) {
             final mediaUrls = vx.data['media_URLs'] as List?;
@@ -964,7 +1276,8 @@ class YtDlpEngine {
               return {
                 'hd': videoUrl,
                 'sd': videoUrl,
-                if (vx.data['text'] != null) 'title': vx.data['text'].toString(),
+                if (vx.data['text'] != null)
+                  'title': vx.data['text'].toString(),
               };
             }
           }
@@ -1016,7 +1329,9 @@ class YtDlpEngine {
       );
 
       String body = res.data.toString();
-      final streamMatches = RegExp(r'href="(https:\/\/[^"]*(?:video\.twimg\.com|twdown\.net)[^"]*)"').allMatches(body);
+      final streamMatches = RegExp(
+        r'href="(https:\/\/[^"]*(?:video\.twimg\.com|twdown\.net)[^"]*)"',
+      ).allMatches(body);
       final List<String> foundUrls = [];
       for (final m in streamMatches) {
         final link = m.group(1)!;
@@ -1026,10 +1341,7 @@ class YtDlpEngine {
       }
 
       if (foundUrls.isNotEmpty) {
-        return {
-          'hd': foundUrls.first,
-          'sd': foundUrls.last,
-        };
+        return {'hd': foundUrls.first, 'sd': foundUrls.last};
       }
     } catch (e) {
       debugPrint('[YtDlpEngine] TwDown error: $e');
@@ -1040,7 +1352,8 @@ class YtDlpEngine {
 
   /// Instagram Direct & Embed Stream Extractor
   Future<String?> _resolveInstagramStream(String url) async {
-    final match = RegExp(r'(?:reel|reels|p|tv|stories)\/([a-zA-Z0-9_-]+)').firstMatch(url);
+    final match = RegExp(r'(?:reel|reels|p|tv|stories)\/([a-zA-Z0-9_-]+)')
+        .firstMatch(url);
     final shortcode = match?.group(1);
 
     // Engine A: Instagram Embed Scraper
@@ -1065,25 +1378,33 @@ class YtDlpEngine {
           );
 
           final body = res.data.toString();
-          
+
           // Try multiple patterns to find video URL
-          final videoMatch = RegExp(r'video_url["\\]*:\s*["\\]*(https:[^"\\]+)').firstMatch(body) ??
-              RegExp(r'playable_url["\\]*:\s*["\\]*(https:[^"\\]+)').firstMatch(body) ??
+          final videoMatch =
+              RegExp(r'video_url["\\]*:\s*["\\]*(https:[^"\\]+)')
+                  .firstMatch(body) ??
+              RegExp(r'playable_url["\\]*:\s*["\\]*(https:[^"\\]+)')
+                  .firstMatch(body) ??
               RegExp(r'<video[^>]+src="([^"]+)"').firstMatch(body) ??
               RegExp(r'"video_url"\s*:\s*"(https[^"]+)"').firstMatch(body);
 
           if (videoMatch != null) {
             final stream = _cleanStreamUrl(videoMatch.group(1)!);
-            if (stream.isNotEmpty && (stream.contains('cdninstagram.com') || stream.contains('fbcdn.net') || stream.contains('instagram'))) {
+            if (stream.isNotEmpty &&
+                (stream.contains('cdninstagram.com') ||
+                    stream.contains('fbcdn.net') ||
+                    stream.contains('instagram'))) {
               return stream;
             }
           }
 
           // Search for any cdninstagram or fbcdn .mp4
-          final allMp4s = RegExp(r'https:[^"\s<>\\]+\.mp4[^"\s<>\\]*').allMatches(body);
+          final allMp4s = RegExp(r'https:[^"\s<>\\]+\.mp4[^"\s<>\\]*')
+              .allMatches(body);
           for (final m in allMp4s) {
             final cleaned = _cleanStreamUrl(m.group(0)!);
-            if (cleaned.contains('cdninstagram.com') || cleaned.contains('fbcdn.net')) {
+            if (cleaned.contains('cdninstagram.com') ||
+                cleaned.contains('fbcdn.net')) {
               return cleaned;
             }
           }
@@ -1126,18 +1447,22 @@ class YtDlpEngine {
           headers: {
             'Origin': 'https://snapinsta.app',
             'Referer': 'https://snapinsta.app/',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'User-Agent':
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
           },
         ),
       );
       if (res.statusCode == 200 && res.data is Map) {
         final html = res.data['data']?.toString() ?? '';
-        final hrefs = RegExp(r'href="(https:\/\/[^"]+(?:cdninstagram|fbcdn|download)[^"]*)"').allMatches(html);
+        final hrefs = RegExp(
+          r'href="(https:\/\/[^"]+(?:cdninstagram|fbcdn|download)[^"]*)"',
+        ).allMatches(html);
         if (hrefs.isNotEmpty) {
           return hrefs.first.group(1)!;
         }
         // Also check for data-url
-        final dataUrl = RegExp(r'data-url="(https:\/\/[^"]+)"').firstMatch(html);
+        final dataUrl = RegExp(r'data-url="(https:\/\/[^"]+)"')
+            .firstMatch(html);
         if (dataUrl != null) return dataUrl.group(1)!;
       }
     } catch (e) {
@@ -1148,17 +1473,23 @@ class YtDlpEngine {
   }
 
   /// Reddit, Pinterest, Threads & Other Media Extractor
-  Future<String?> _resolveOtherMediaStream(String url, {bool isAudioOnly = false}) async {
+  Future<String?> _resolveOtherMediaStream(
+    String url, {
+    bool isAudioOnly = false,
+  }) async {
     // Reddit
     if (url.contains('reddit.com') || url.contains('redd.it')) {
       try {
         final clean = url.split('?').first.replaceAll(RegExp(r'\/$'), '');
         final res = await _dio.get('$clean.json');
-        if (res.statusCode == 200 && res.data is List && (res.data as List).isNotEmpty) {
+        if (res.statusCode == 200 &&
+            res.data is List &&
+            (res.data as List).isNotEmpty) {
           final postData = res.data[0]['data']['children'][0]['data'];
           final secureMedia = postData['secure_media'] ?? postData['media'];
           if (secureMedia != null && secureMedia['reddit_video'] != null) {
-            final fallback = secureMedia['reddit_video']['fallback_url']?.toString();
+            final fallback = secureMedia['reddit_video']['fallback_url']
+                ?.toString();
             if (fallback != null) return fallback;
           }
         }
@@ -1170,9 +1501,14 @@ class YtDlpEngine {
     // Pinterest
     if (url.contains('pinterest.com') || url.contains('pin.it')) {
       try {
-        final res = await _dio.get(url, options: Options(headers: {'User-Agent': 'Mozilla/5.0'}));
+        final res = await _dio.get(
+          url,
+          options: Options(headers: {'User-Agent': 'Mozilla/5.0'}),
+        );
         final body = res.data.toString();
-        final videoMatch = RegExp(r'https:\/\/[^"\s<>]+\.(?:pinimg\.com|pinterest\.com)[^"\s<>]+\.mp4[^"\s<>]*').firstMatch(body);
+        final videoMatch = RegExp(
+          r'https:\/\/[^"\s<>]+\.(?:pinimg\.com|pinterest\.com)[^"\s<>]+\.mp4[^"\s<>]*',
+        ).firstMatch(body);
         if (videoMatch != null) return _cleanStreamUrl(videoMatch.group(0)!);
       } catch (e) {
         debugPrint('[YtDlpEngine] Error: $e');
@@ -1196,11 +1532,121 @@ class YtDlpEngine {
         .replaceAll('&amp;', '&');
   }
 
+  /// Generic resumable HTTP downloader used by [_downloadViaDirectHttp].
+  /// When [resume] is true and [targetFile] already has bytes on disk, asks
+  /// the server for the remainder via a Range header and appends; if the
+  /// server doesn't honor the range (no 206 response), falls back to
+  /// re-downloading the whole file from scratch so the output is never
+  /// corrupted by mismatched byte offsets.
+  Future<void> _resumableHttpDownload({
+    required String urlStr,
+    required File targetFile,
+    required bool resume,
+    required Map<String, String> headers,
+    required void Function(Map<String, dynamic> event) emit,
+  }) async {
+    int existingBytes = 0;
+    if (resume && await targetFile.exists()) {
+      existingBytes = await targetFile.length();
+    } else if (await targetFile.exists()) {
+      await targetFile.delete();
+    }
+
+    final reqHeaders = Map<String, String>.from(headers);
+    if (existingBytes > 0) {
+      reqHeaders['Range'] = 'bytes=$existingBytes-';
+    }
+
+    final response = await _dio.get<ResponseBody>(
+      urlStr,
+      options: Options(
+        headers: reqHeaders,
+        responseType: ResponseType.stream,
+        followRedirects: true,
+        validateStatus: (s) => s != null && s < 500,
+      ),
+    );
+
+    final body = response.data;
+    if (body == null || (response.statusCode ?? 0) >= 400) {
+      throw Exception('HTTP ${response.statusCode} while downloading');
+    }
+
+    final resumed = existingBytes > 0 && response.statusCode == 206;
+    final sink = resumed ? targetFile.openWrite(mode: FileMode.append) : targetFile.openWrite();
+    int received = resumed ? existingBytes : 0;
+
+    int? totalBytes;
+    final clHeader = response.headers.value(Headers.contentLengthHeader);
+    if (clHeader != null) {
+      final cl = int.tryParse(clHeader);
+      if (cl != null && cl > 0) {
+        totalBytes = resumed ? existingBytes + cl : cl;
+      }
+    }
+
+    final startTime = DateTime.now();
+    DateTime lastTime = startTime;
+    int lastBytes = received;
+    String currentSpeed = '0 KB/s';
+
+    await for (final chunk in body.stream) {
+      sink.add(chunk);
+      received += chunk.length;
+
+      final now = DateTime.now();
+      final elapsedSec = now.difference(lastTime).inMilliseconds / 1000.0;
+      if (elapsedSec < 0.4) continue;
+
+      final bytesDiff = received - lastBytes;
+      final speedBps = bytesDiff / (elapsedSec > 0 ? elapsedSec : 1.0);
+      currentSpeed = speedBps > 1024 * 1024
+          ? '${(speedBps / (1024 * 1024)).toStringAsFixed(1)} MB/s'
+          : '${(speedBps / 1024).toStringAsFixed(0)} KB/s';
+      lastBytes = received;
+      lastTime = now;
+
+      if (totalBytes != null && totalBytes > 0) {
+        final progress = (received / totalBytes).clamp(0.0, 1.0);
+        final remainingBytes = totalBytes - received;
+        final totalElapsedSec = now.difference(startTime).inSeconds;
+        final avgSpeed = totalElapsedSec > 0
+            ? (received - (resumed ? existingBytes : 0)) / totalElapsedSec
+            : 1.0;
+        final remainingSec = avgSpeed > 0 ? (remainingBytes / avgSpeed).round() : 0;
+        final etaStr = '${remainingSec ~/ 60}:${(remainingSec % 60).toString().padLeft(2, '0')}';
+        final totalMb = (totalBytes / (1024 * 1024)).toStringAsFixed(1);
+        emit({
+          'type': 'progress',
+          'progress': progress,
+          'percentageStr': '${(progress * 100).toInt()}%',
+          'totalSizeStr': '$totalMb MB',
+          'speed': currentSpeed,
+          'eta': etaStr,
+        });
+      } else {
+        final receivedMb = (received / (1024 * 1024)).toStringAsFixed(1);
+        emit({
+          'type': 'progress',
+          'progress': 0.5,
+          'percentageStr': '$receivedMb MB',
+          'totalSizeStr': '$receivedMb MB',
+          'speed': currentSpeed,
+          'eta': '...',
+        });
+      }
+    }
+
+    await sink.flush();
+    await sink.close();
+  }
+
   Stream<Map<String, dynamic>> _downloadViaDirectHttp({
     required String url,
     required DownloadFormat format,
     required String outputDir,
     String? customFilename,
+    bool resume = false,
   }) {
     final controller = StreamController<Map<String, dynamic>>();
 
@@ -1211,9 +1657,12 @@ class YtDlpEngine {
           await outDir.create(recursive: true);
         }
 
-        final ext = format.isAudioOnly ? (format.ext.isNotEmpty ? format.ext : 'mp3') : 'mp4';
-        final sanitizedTitle = (customFilename ?? 'media_${DateTime.now().millisecondsSinceEpoch}')
-            .replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
+        final ext = format.isAudioOnly
+            ? (format.ext.isNotEmpty ? format.ext : 'mp3')
+            : 'mp4';
+        final sanitizedTitle =
+            (customFilename ?? 'media_${DateTime.now().millisecondsSinceEpoch}')
+                .replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
         final targetFilePath = p.join(outputDir, '$sanitizedTitle.$ext');
 
         controller.add({
@@ -1245,95 +1694,22 @@ class YtDlpEngine {
           return;
         }
 
-        final startTime = DateTime.now();
-        int lastBytes = 0;
-        DateTime lastTime = DateTime.now();
-        String currentSpeed = '0 KB/s';
-
-        await _dio.download(
-          directStreamUrl,
-          targetFilePath,
-          options: Options(
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-              'Accept': '*/*',
-              'Referer': url,
-            },
-          ),
-          onReceiveProgress: (received, total) {
-            if (total > 0) {
-              final now = DateTime.now();
-              final elapsedSec = now.difference(lastTime).inMilliseconds / 1000.0;
-
-              if (elapsedSec >= 0.4) {
-                final bytesDiff = received - lastBytes;
-                final speedBps = bytesDiff / (elapsedSec > 0 ? elapsedSec : 1.0);
-                if (speedBps > 1024 * 1024) {
-                  currentSpeed = '${(speedBps / (1024 * 1024)).toStringAsFixed(1)} MB/s';
-                } else {
-                  currentSpeed = '${(speedBps / 1024).toStringAsFixed(0)} KB/s';
-                }
-                lastBytes = received;
-                lastTime = now;
-              }
-
-              final progress = (received / total).clamp(0.0, 1.0);
-              final remainingBytes = total - received;
-              final totalElapsed = now.difference(startTime).inSeconds;
-              final avgSpeed = totalElapsed > 0 ? received / totalElapsed : 1.0;
-              final remainingSec = avgSpeed > 0 ? (remainingBytes / avgSpeed).round() : 0;
-              final etaStr = '${(remainingSec ~/ 60)}:${(remainingSec % 60).toString().padLeft(2, '0')}';
-
-              final totalMb = (total / (1024 * 1024)).toStringAsFixed(1);
-              final percentInt = (progress * 100).toInt();
-
-              controller.add({
-                'type': 'progress',
-                'progress': progress,
-                'percentageStr': '$percentInt%',
-                'totalSizeStr': '$totalMb MB',
-                'speed': currentSpeed,
-                'eta': etaStr,
-              });
-            } else {
-              // Unknown total length chunked download
-              final now = DateTime.now();
-              final elapsedSec = now.difference(lastTime).inMilliseconds / 1000.0;
-              if (elapsedSec >= 0.5) {
-                final bytesDiff = received - lastBytes;
-                final speedBps = bytesDiff / (elapsedSec > 0 ? elapsedSec : 1.0);
-                if (speedBps > 1024 * 1024) {
-                  currentSpeed = '${(speedBps / (1024 * 1024)).toStringAsFixed(1)} MB/s';
-                } else {
-                  currentSpeed = '${(speedBps / 1024).toStringAsFixed(0)} KB/s';
-                }
-                lastBytes = received;
-                lastTime = now;
-
-                final receivedMb = (received / (1024 * 1024)).toStringAsFixed(1);
-                controller.add({
-                  'type': 'progress',
-                  'progress': 0.5,
-                  'percentageStr': '$receivedMb MB',
-                  'totalSizeStr': '$receivedMb MB',
-                  'speed': currentSpeed,
-                  'eta': '...',
-                });
-              }
-            }
+        await _resumableHttpDownload(
+          urlStr: directStreamUrl,
+          targetFile: File(targetFilePath),
+          resume: resume,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Accept': '*/*',
+            'Referer': url,
           },
+          emit: controller.add,
         );
 
-        controller.add({
-          'type': 'completed',
-          'filePath': targetFilePath,
-        });
+        controller.add({'type': 'completed', 'filePath': targetFilePath});
         await controller.close();
       } catch (e) {
-        controller.add({
-          'type': 'error',
-          'message': 'Download failed: $e',
-        });
+        controller.add({'type': 'error', 'message': 'Download failed: $e'});
         await controller.close();
       }
     }();
@@ -1365,7 +1741,9 @@ class YtDlpEngine {
 
     final outTemplate = p.join(
       outputDir,
-      customFilename != null ? '$customFilename.%(ext)s' : '%(title)s [%(id)s].%(ext)s',
+      customFilename != null
+          ? '$customFilename.%(ext)s'
+          : '%(title)s [%(id)s].%(ext)s',
     );
 
     List<String> args = [
@@ -1397,7 +1775,13 @@ class YtDlpEngine {
           url,
         ]);
       } else {
-        args.addAll(['-f', 'bestvideo+bestaudio/best', '--merge-output-format', 'mp4', url]);
+        args.addAll([
+          '-f',
+          'bestvideo+bestaudio/best',
+          '--merge-output-format',
+          'mp4',
+          url,
+        ]);
       }
     }
 
@@ -1487,15 +1871,19 @@ class YtDlpEngine {
     if (url.trim().isEmpty) return null;
     final trimmed = url.trim();
     if (RegExp(r'^[a-zA-Z0-9_-]{11}$').hasMatch(trimmed)) return trimmed;
-    final shortMatch = RegExp(r'youtu\.be\/([a-zA-Z0-9_-]{11})').firstMatch(trimmed);
+    final shortMatch = RegExp(r'youtu\.be\/([a-zA-Z0-9_-]{11})')
+        .firstMatch(trimmed);
     if (shortMatch != null) return shortMatch.group(1);
     final watchMatch = RegExp(r'[?&]v=([a-zA-Z0-9_-]{11})').firstMatch(trimmed);
     if (watchMatch != null) return watchMatch.group(1);
-    final shortsMatch = RegExp(r'youtube\.com\/shorts\/([a-zA-Z0-9_-]{11})').firstMatch(trimmed);
+    final shortsMatch = RegExp(r'youtube\.com\/shorts\/([a-zA-Z0-9_-]{11})')
+        .firstMatch(trimmed);
     if (shortsMatch != null) return shortsMatch.group(1);
-    final liveMatch = RegExp(r'youtube\.com\/live\/([a-zA-Z0-9_-]{11})').firstMatch(trimmed);
+    final liveMatch = RegExp(r'youtube\.com\/live\/([a-zA-Z0-9_-]{11})')
+        .firstMatch(trimmed);
     if (liveMatch != null) return liveMatch.group(1);
-    final embedMatch = RegExp(r'youtube\.com\/embed\/([a-zA-Z0-9_-]{11})').firstMatch(trimmed);
+    final embedMatch = RegExp(r'youtube\.com\/embed\/([a-zA-Z0-9_-]{11})')
+        .firstMatch(trimmed);
     if (embedMatch != null) return embedMatch.group(1);
     return null;
   }

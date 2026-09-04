@@ -78,6 +78,17 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', ytdlp: YTDLP_PATH });
 });
 
+app.post('/update', checkAuth, (req, res) => {
+  execFile(YTDLP_PATH, ['--update-to', 'nightly'], { timeout: 60000 }, (error, stdout, stderr) => {
+    if (error) {
+      console.error('[update] yt-dlp update to nightly failed:', error.message);
+      return res.status(500).json({ error: error.message, stderr });
+    }
+    console.log('[update] yt-dlp update to nightly:', stdout.trim());
+    return res.json({ status: 'ok', output: stdout.trim() || stderr.trim() });
+  });
+});
+
 app.post('/extract', checkAuth, (req, res) => {
   const url = req.body && req.body.url;
   if (!url || typeof url !== 'string') {
@@ -128,11 +139,20 @@ app.post('/extract', checkAuth, (req, res) => {
         const lines = stdout.trim().split('\n').filter(Boolean);
         const json = JSON.parse(lines[lines.length - 1]);
 
-        // Photo-only post: --ignore-no-formats-error lets this through with
-        // an empty/missing `formats` array but a real `thumbnail`/`url`
-        // pointing at the full-resolution image. Synthesize a single
-        // "photo" format from it so the app has something to download.
-        if ((!json.formats || json.formats.length === 0)) {
+        // If it's YouTube and yielded 0 formats, do not treat as photo post.
+        // Attempt fallback via @distube/ytdl-core or report error.
+        if (!json.formats || json.formats.length === 0) {
+          if (isYoutubeUrl(url)) {
+            console.log('[extract] YouTube video yielded 0 formats from yt-dlp, attempting fallback via ytdl-core...');
+            const ytdlJson = await tryExtractViaYtdlCore(url);
+            if (ytdlJson && ytdlJson.formats && ytdlJson.formats.length > 0) {
+              return res.json(ytdlJson);
+            }
+            return res.status(502).json({
+              error: 'extraction_failed',
+              message: 'YouTube video yielded 0 formats from yt-dlp and fallback failed',
+            });
+          }
           const imageUrl = json.thumbnail || json.url;
           if (imageUrl) {
             json.formats = [
@@ -326,12 +346,12 @@ async function tryExtractInstagramPhoto(url) {
 // until someone happens to redeploy. Self-updating on every boot means each
 // cold start is also a chance to pick up a yt-dlp fix, no redeploy needed.
 function selfUpdateYtdlp() {
-  execFile(YTDLP_PATH, ['-U'], { timeout: 30000 }, (error, stdout, stderr) => {
+  execFile(YTDLP_PATH, ['--update-to', 'nightly'], { timeout: 60000 }, (error, stdout, stderr) => {
     if (error) {
-      console.error('[startup] yt-dlp self-update failed (continuing with existing binary):', error.message);
+      console.error('[startup] yt-dlp nightly self-update failed (continuing with existing binary):', error.message);
       return;
     }
-    console.log('[startup] yt-dlp self-update:', stdout.trim() || stderr.trim());
+    console.log('[startup] yt-dlp nightly self-update:', stdout.trim() || stderr.trim());
   });
 }
 
