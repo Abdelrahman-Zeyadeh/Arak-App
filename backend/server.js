@@ -395,6 +395,70 @@ app.get('/yt/channels', checkAuth, ytProxyLimiter, async (req, res) => {
   }
 });
 
+// 4. Playlist items proxy (uploads playlist UU...) (2 hours cache)
+app.get('/yt/playlistItems', checkAuth, ytProxyLimiter, async (req, res) => {
+  const playlistId = req.query.playlistId;
+  if (!playlistId) return res.status(400).json({ error: 'playlistId query param is required' });
+
+  const maxResults = req.query.maxResults || '25';
+  const pageToken = req.query.pageToken || '';
+  const cacheKey = `playlistItems:${playlistId}:${pageToken}:${maxResults}`;
+
+  const cached = ytCache.get(cacheKey);
+  if (cached) {
+    return res.json({ ...cached, _cached: true });
+  }
+
+  try {
+    const data = await fetchFromYouTube('playlistItems', {
+      part: req.query.part || 'snippet,contentDetails',
+      playlistId,
+      maxResults,
+      pageToken: pageToken || undefined,
+    });
+
+    ytCache.set(cacheKey, data, 2 * 60 * 60 * 1000); // 2 hours
+    return res.json(data);
+  } catch (err) {
+    console.error('[yt-proxy] /yt/playlistItems failed:', err.message);
+    return res.status(502).json({ error: 'yt_api_failed', message: err.message });
+  }
+});
+
+// 5. Search proxy (1 hour cache)
+app.get('/yt/search', checkAuth, ytProxyLimiter, async (req, res) => {
+  const q = req.query.q;
+  if (!q) return res.status(400).json({ error: 'q query param is required' });
+
+  const maxResults = req.query.maxResults || '25';
+  const pageToken = req.query.pageToken || '';
+  const type = req.query.type || 'video';
+  const order = req.query.order || 'relevance';
+  const cacheKey = `search:${q}:${type}:${order}:${pageToken}:${maxResults}`;
+
+  const cached = ytCache.get(cacheKey);
+  if (cached) {
+    return res.json({ ...cached, _cached: true });
+  }
+
+  try {
+    const data = await fetchFromYouTube('search', {
+      part: 'snippet',
+      q,
+      type,
+      maxResults,
+      order,
+      pageToken: pageToken || undefined,
+    });
+
+    ytCache.set(cacheKey, data, 60 * 60 * 1000); // 1 hour
+    return res.json(data);
+  } catch (err) {
+    console.error('[yt-proxy] /yt/search failed:', err.message);
+    return res.status(502).json({ error: 'yt_api_failed', message: err.message });
+  }
+});
+
 // Enhanced real health check (Stage 2)
 let cachedHealthYtdlp = { version: null, error: null, checkedAt: 0 };
 
