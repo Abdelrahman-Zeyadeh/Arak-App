@@ -1,2 +1,6 @@
 node_modules/
 npm-debug.log
+
+# Real YouTube session cookies are a login for whatever account exported
+# them — they reach production through the COOKIES_CONTENT env var, never git.
+*cookies*.txt

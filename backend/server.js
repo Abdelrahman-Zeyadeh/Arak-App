@@ -16,12 +16,45 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
 const express = require('express');
 const { execFile, spawn } = require('child_process');
+const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
 const ytdl = require('@distube/ytdl-core');
 
 const app = express();
 app.use(express.json({ limit: '256kb' }));
+
+// Structured JSON request logging & request-id tracking (Stage 2)
+app.use((req, res, next) => {
+  const reqId = req.headers['x-request-id'] || crypto.randomUUID();
+  req.id = reqId;
+  res.setHeader('x-request-id', reqId);
+  const start = Date.now();
+  const deviceId = req.headers['x-device-id'] || null;
+
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    const logData = {
+      level: res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info',
+      time: new Date().toISOString(),
+      reqId,
+      method: req.method,
+      path: req.path,
+      status: res.statusCode,
+      durationMs: duration,
+      ip: req.ip || req.connection.remoteAddress || null,
+      deviceId: deviceId ? `${deviceId.slice(0, 8)}...` : undefined,
+    };
+    if (res.statusCode >= 500) {
+      console.error(JSON.stringify(logData));
+    } else {
+      console.log(JSON.stringify(logData));
+    }
+  });
+
+  next();
+});
 
 const PORT = process.env.PORT || 3000;
 const YTDLP_PATH = process.env.YTDLP_PATH || 'yt-dlp';
@@ -62,23 +95,357 @@ if (!COOKIES_PATH && process.env.COOKIES_CONTENT) {
     COOKIES_PATH = '';
   }
 }
-// Comma-separated client list for yt-dlp's `player_client` extractor-arg
-// (e.g. "android,web"). Left unset by default so yt-dlp keeps using its own
-// built-in client-selection logic; only override this if testing shows a
-// specific client combination works better against the current break.
+// Comma-separated client list for yt-dlp's `player_client` extractor-arg.
+// Default to empty so yt-dlp uses its full default extractor clients which extract all 40+ audio/video formats.
 const PLAYER_CLIENT = process.env.PLAYER_CLIENT || '';
 
+// Device ids abusing the server, comma-separated. The only lever available
+// for cutting one off without shipping a new app build.
+const BLOCKED_DEVICE_IDS = new Set(
+  (process.env.BLOCKED_DEVICE_IDS || '').split(',').map((d) => d.trim()).filter(Boolean),
+);
+
+// Shape of the id the app generates (SecureStorageService.getDeviceId):
+// "arak_<hex>". Checked so the header carries something we can attribute a
+// rate-limit bucket and a block to, rather than any eight characters.
+const DEVICE_ID_PATTERN = /^[A-Za-z0-9_-]{12,128}$/;
+
+/// Gate for the routes the app itself calls (/extract, /yt/*).
+///
+/// This is **identification, not authentication**: the device id is
+/// self-asserted, so anyone can mint one. That is deliberate — the id is
+/// baked into every install and there is no registration handshake yet, so
+/// treating it as a secret would only lock out real users. What it does buy
+/// is a stable key for per-device rate limiting and for BLOCKED_DEVICE_IDS.
+///
+/// Nothing dangerous may sit behind this gate. Anything that runs a command,
+/// mutates the server, or exposes its internals goes behind
+/// [requireAdminKey] instead, which needs the real API_KEY.
 function checkAuth(req, res, next) {
+  const apiKey = req.headers['x-api-key'];
+  if (API_KEY && apiKey === API_KEY) return next();
+
+  const deviceId = (req.headers['x-device-id'] || '').trim();
+  if (deviceId && BLOCKED_DEVICE_IDS.has(deviceId)) {
+    return res.status(403).json({ error: 'device_blocked' });
+  }
+  if (DEVICE_ID_PATTERN.test(deviceId)) return next();
   if (!API_KEY) return next();
+  return res.status(401).json({ error: 'unauthorized' });
+}
+
+/// Gate for operator-only routes. Requires the real API_KEY — a device id is
+/// never enough, because a device id is not a secret (see [checkAuth]).
+/// With no API_KEY configured these routes stay shut rather than falling
+/// open, and answer 404 so an unconfigured server doesn't advertise them.
+function requireAdminKey(req, res, next) {
+  if (!API_KEY) return res.status(404).json({ error: 'not_found' });
   if (req.headers['x-api-key'] === API_KEY) return next();
   return res.status(401).json({ error: 'unauthorized' });
 }
 
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', ytdlp: YTDLP_PATH });
+// --- YouTube Data API Proxy & Caching (Stage 1) ---
+const YT_API_KEYS = (process.env.YT_API_KEYS || process.env.YOUTUBE_API_KEY || '').split(',').map(k => k.trim()).filter(Boolean);
+let currentKeyIndex = 0;
+
+class SimpleCache {
+  constructor(maxSize = 1000) {
+    this.maxSize = maxSize;
+    this.map = new Map();
+  }
+
+  get(key) {
+    const entry = this.map.get(key);
+    if (!entry) return null;
+    if (Date.now() > entry.expiry) {
+      this.map.delete(key);
+      return null;
+    }
+    // Refresh LRU order
+    this.map.delete(key);
+    this.map.set(key, entry);
+    return entry.value;
+  }
+
+  set(key, value, ttlMs) {
+    if (this.map.size >= this.maxSize) {
+      const oldestKey = this.map.keys().next().value;
+      if (oldestKey) this.map.delete(oldestKey);
+    }
+    this.map.set(key, { value, expiry: Date.now() + ttlMs });
+  }
+}
+
+const ytCache = new SimpleCache(1000);
+const extractionCache = new SimpleCache(500);
+const EXTRACTION_CACHE_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
+
+// --- Rate Limiting & Concurrency Hardening (Stage 2) ---
+const keyGenerator = (req) => {
+  const deviceId = req.headers['x-device-id'];
+  if (deviceId && typeof deviceId === 'string' && deviceId.trim().length >= 8) {
+    return `dev:${deviceId.trim()}`;
+  }
+  const ip = req.ip || req.connection.remoteAddress || '127.0.0.1';
+  return typeof ipKeyGenerator === 'function' ? ipKeyGenerator(ip) : `ip:${ip}`;
+};
+
+const ytProxyLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  limit: 60, // 60 requests per minute per device/IP
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  keyGenerator,
+  validate: { keyGeneratorIpFallback: false },
+  message: { error: 'too_many_requests', message: 'API rate limit exceeded. Please slow down.' },
 });
 
-app.post('/update', checkAuth, (req, res) => {
+const extractionLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  limit: 15, // 15 extraction requests per minute per device/IP
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  keyGenerator,
+  validate: { keyGeneratorIpFallback: false },
+  message: { error: 'too_many_requests', message: 'Extraction rate limit exceeded. Please slow down.' },
+});
+
+class ConcurrencyQueue {
+  constructor(maxConcurrent = 3, maxQueueSize = 10) {
+    this.maxConcurrent = maxConcurrent;
+    this.maxQueueSize = maxQueueSize;
+    this.running = 0;
+    this.queue = [];
+  }
+
+  get stats() {
+    return {
+      running: this.running,
+      queued: this.queue.length,
+      maxConcurrent: this.maxConcurrent,
+      maxQueueSize: this.maxQueueSize,
+    };
+  }
+
+  acquire() {
+    if (this.running < this.maxConcurrent) {
+      this.running++;
+      return Promise.resolve(() => this.release());
+    }
+
+    if (this.queue.length >= this.maxQueueSize) {
+      const err = new Error('Server is busy processing other extractions. Please retry in a few moments.');
+      err.code = 'QUEUE_FULL';
+      err.status = 429;
+      return Promise.reject(err);
+    }
+
+    return new Promise((resolve, reject) => {
+      this.queue.push({
+        resolve: () => {
+          this.running++;
+          resolve(() => this.release());
+        },
+        reject,
+      });
+    });
+  }
+
+  release() {
+    this.running = Math.max(0, this.running - 1);
+    if (this.queue.length > 0 && this.running < this.maxConcurrent) {
+      const next = this.queue.shift();
+      if (next) next.resolve();
+    }
+  }
+}
+
+const extractQueue = new ConcurrencyQueue(3, 10);
+
+async function fetchFromYouTube(endpoint, params = {}) {
+  if (YT_API_KEYS.length === 0) {
+    throw new Error('No YouTube API keys configured on backend (set YT_API_KEYS)');
+  }
+
+  let lastError = null;
+  for (let attempt = 0; attempt < YT_API_KEYS.length; attempt++) {
+    const key = YT_API_KEYS[currentKeyIndex];
+    const url = new URL(`https://www.googleapis.com/youtube/v3/${endpoint}`);
+    for (const [k, v] of Object.entries(params)) {
+      if (v !== undefined && v !== null && v !== '') {
+        url.searchParams.set(k, v);
+      }
+    }
+    url.searchParams.set('key', key);
+
+    try {
+      const resp = await fetch(url.toString(), {
+        headers: { 'Accept': 'application/json' }
+      });
+      const data = await resp.json();
+
+      if (resp.status === 403 && data.error && data.error.errors && data.error.errors.some(e => e.reason === 'quotaExceeded')) {
+        console.warn(`[yt-proxy] Key index ${currentKeyIndex} exceeded quota. Rotating key...`);
+        currentKeyIndex = (currentKeyIndex + 1) % YT_API_KEYS.length;
+        continue;
+      }
+
+      if (!resp.ok) {
+        const msg = data.error ? data.error.message : `HTTP ${resp.status}`;
+        throw new Error(msg);
+      }
+
+      return data;
+    } catch (err) {
+      lastError = err;
+      if (err.message && err.message.includes('quotaExceeded')) {
+        currentKeyIndex = (currentKeyIndex + 1) % YT_API_KEYS.length;
+        continue;
+      }
+      throw err;
+    }
+  }
+
+  throw lastError || new Error('All YouTube API keys exhausted');
+}
+
+// 1. Trending videos proxy (30 min cache)
+app.get('/yt/trending', checkAuth, ytProxyLimiter, async (req, res) => {
+  const regionCode = req.query.regionCode || 'US';
+  const videoCategoryId = req.query.videoCategoryId || '0';
+  const pageToken = req.query.pageToken || '';
+  const maxResults = req.query.maxResults || '25';
+  const cacheKey = `trending:${regionCode}:${videoCategoryId}:${pageToken}:${maxResults}`;
+
+  const cached = ytCache.get(cacheKey);
+  if (cached) {
+    return res.json({ ...cached, _cached: true });
+  }
+
+  try {
+    const data = await fetchFromYouTube('videos', {
+      part: 'snippet,contentDetails,statistics',
+      chart: 'mostPopular',
+      regionCode,
+      videoCategoryId: videoCategoryId !== '0' ? videoCategoryId : undefined,
+      pageToken: pageToken || undefined,
+      maxResults,
+    });
+
+    ytCache.set(cacheKey, data, 30 * 60 * 1000); // 30 minutes
+    return res.json(data);
+  } catch (err) {
+    console.error('[yt-proxy] /yt/trending failed:', err.message);
+    return res.status(502).json({ error: 'yt_api_failed', message: err.message });
+  }
+});
+
+// 2. Video details proxy (24h cache)
+app.get('/yt/videos', checkAuth, ytProxyLimiter, async (req, res) => {
+  const id = req.query.id;
+  if (!id) return res.status(400).json({ error: 'id query param is required' });
+
+  const cacheKey = `videos:${id}`;
+  const cached = ytCache.get(cacheKey);
+  if (cached) {
+    return res.json({ ...cached, _cached: true });
+  }
+
+  try {
+    const data = await fetchFromYouTube('videos', {
+      part: req.query.part || 'snippet,contentDetails,statistics',
+      id,
+    });
+
+    ytCache.set(cacheKey, data, 24 * 60 * 60 * 1000); // 24 hours
+    return res.json(data);
+  } catch (err) {
+    console.error('[yt-proxy] /yt/videos failed:', err.message);
+    return res.status(502).json({ error: 'yt_api_failed', message: err.message });
+  }
+});
+
+// 3. Channels proxy (7 days cache)
+app.get('/yt/channels', checkAuth, ytProxyLimiter, async (req, res) => {
+  const id = req.query.id;
+  const forHandle = req.query.forHandle;
+  if (!id && !forHandle) {
+    return res.status(400).json({ error: 'id or forHandle query param is required' });
+  }
+
+  const cacheKey = `channels:${id || forHandle}`;
+  const cached = ytCache.get(cacheKey);
+  if (cached) {
+    return res.json({ ...cached, _cached: true });
+  }
+
+  try {
+    const params = {
+      part: req.query.part || 'snippet,statistics,brandingSettings',
+    };
+    if (id) params.id = id;
+    if (forHandle) params.forHandle = forHandle;
+
+    const data = await fetchFromYouTube('channels', params);
+    ytCache.set(cacheKey, data, 7 * 24 * 60 * 60 * 1000); // 7 days
+    return res.json(data);
+  } catch (err) {
+    console.error('[yt-proxy] /yt/channels failed:', err.message);
+    return res.status(502).json({ error: 'yt_api_failed', message: err.message });
+  }
+});
+
+// Enhanced real health check (Stage 2)
+let cachedHealthYtdlp = { version: null, error: null, checkedAt: 0 };
+
+async function getYtdlpVersion() {
+  const now = Date.now();
+  if (now - cachedHealthYtdlp.checkedAt < 60 * 1000 && (cachedHealthYtdlp.version || cachedHealthYtdlp.error)) {
+    return cachedHealthYtdlp;
+  }
+  return new Promise((resolve) => {
+    execFile(YTDLP_PATH, ['--version'], { timeout: 10000 }, (err, stdout, stderr) => {
+      if (err) {
+        cachedHealthYtdlp = { version: null, error: (stderr || err.message || '').trim(), checkedAt: now };
+      } else {
+        cachedHealthYtdlp = { version: (stdout || '').trim(), error: null, checkedAt: now };
+      }
+      resolve(cachedHealthYtdlp);
+    });
+  });
+}
+
+app.get('/health', async (req, res) => {
+  const ytdlpInfo = await getYtdlpVersion();
+  const cookiesLoaded = !!COOKIES_PATH && fs.existsSync(COOKIES_PATH);
+  const mem = process.memoryUsage();
+
+  const healthData = {
+    status: ytdlpInfo.error ? 'degraded' : 'ok',
+    uptimeSeconds: Math.floor(process.uptime()),
+    timestamp: new Date().toISOString(),
+    ytdlp: {
+      path: YTDLP_PATH,
+      version: ytdlpInfo.version,
+      error: ytdlpInfo.error,
+    },
+    cookiesLoaded,
+    queue: extractQueue.stats,
+    cache: {
+      ytItems: ytCache.map.size,
+      extractionItems: extractionCache.map.size,
+    },
+    memory: {
+      rssMb: Math.round(mem.rss / 1024 / 1024),
+      heapUsedMb: Math.round(mem.heapUsed / 1024 / 1024),
+    },
+  };
+
+  const statusCode = ytdlpInfo.error ? 503 : 200;
+  return res.status(statusCode).json(healthData);
+});
+
+app.post('/update', requireAdminKey, (req, res) => {
   execFile(YTDLP_PATH, ['--update-to', 'nightly'], { timeout: 60000 }, (error, stdout, stderr) => {
     if (error) {
       console.error('[update] yt-dlp update to nightly failed:', error.message);
@@ -89,10 +456,75 @@ app.post('/update', checkAuth, (req, res) => {
   });
 });
 
-app.post('/extract', checkAuth, (req, res) => {
+// Arguments are always built internally and never read from the request.
+// yt-dlp has flags that run system commands (--exec among them), so echoing
+// a caller-supplied argv into execFile turns a diagnostic route into remote
+// command execution — which it was, reachable with any well-formed device
+// id and no API key at all. Behind requireAdminKey for the same reason:
+// stderr and the raw stdout snippet are operator information.
+app.post('/debug-extract', requireAdminKey, extractionLimiter, async (req, res) => {
   const url = req.body && req.body.url;
   if (!url || typeof url !== 'string') {
     return res.status(400).json({ error: 'url is required' });
+  }
+  const args = ytdlpArgs(url);
+
+  let release;
+  try {
+    release = await extractQueue.acquire();
+  } catch (queueErr) {
+    if (queueErr.code === 'QUEUE_FULL') {
+      res.setHeader('Retry-After', '5');
+      return res.status(429).json({ error: 'server_busy', message: queueErr.message });
+    }
+    return res.status(500).json({ error: 'queue_error', message: queueErr.message });
+  }
+
+  execFile(YTDLP_PATH, args, { maxBuffer: 1024 * 1024 * 25, timeout: 30000 }, (err, stdout, stderr) => {
+    release();
+    let parsedFormatsCount = 0;
+    try {
+      const lines = stdout.trim().split('\n').filter(Boolean);
+      const json = JSON.parse(lines[lines.length - 1]);
+      parsedFormatsCount = json.formats ? json.formats.length : 0;
+    } catch(e) {}
+    res.json({
+      exitCode: err ? err.code : 0,
+      error: err ? err.message : null,
+      args,
+      formatsCount: parsedFormatsCount,
+      stderr,
+      stdoutLength: (stdout || '').length,
+      stdoutSnippet: (stdout || '').substring(0, 500),
+    });
+  });
+});
+
+app.post('/extract', checkAuth, extractionLimiter, async (req, res) => {
+  const url = req.body && req.body.url;
+  if (!url || typeof url !== 'string') {
+    return res.status(400).json({ error: 'url is required' });
+  }
+
+  // 1. Check extraction cache (Stage 2)
+  const cached = extractionCache.get(url);
+  if (cached) {
+    return res.json({ ...cached, _cached: true });
+  }
+
+  // 2. Concurrency limit & queue (Stage 2)
+  let release;
+  try {
+    release = await extractQueue.acquire();
+  } catch (queueErr) {
+    if (queueErr.code === 'QUEUE_FULL') {
+      res.setHeader('Retry-After', '5');
+      return res.status(429).json({
+        error: 'server_busy',
+        message: queueErr.message,
+      });
+    }
+    return res.status(500).json({ error: 'queue_error', message: queueErr.message });
   }
 
   const args = ytdlpArgs(url);
@@ -102,50 +534,45 @@ app.post('/extract', checkAuth, (req, res) => {
     args,
     { maxBuffer: 1024 * 1024 * 25, timeout: 45000 },
     async (err, stdout, stderr) => {
-      if (err) {
-        const message = (stderr || err.message || '').toString();
-        console.error('[extract] yt-dlp failed:', message);
-
-        // Last-resort fallback for Instagram photo posts if the flag above
-        // still didn't yield metadata for some reason: scrape the public
-        // page's og:image directly.
-        if (url.includes('instagram.com') && /no video in this post/i.test(message)) {
-          const photoJson = await tryExtractInstagramPhoto(url);
-          if (photoJson) return res.json(photoJson);
-        }
-
-        // yt-dlp is a single shared open-source project — when YouTube ships
-        // a breaking internal change, every yt-dlp install worldwide fails
-        // the same way (e.g. "Failed to extract any player response") until
-        // its maintainers ship a fix release, which can take a day or more.
-        // @distube/ytdl-core is a separate, independently-maintained
-        // extractor for YouTube specifically — often already patched for
-        // exactly this kind of break, or breaks on a different schedule —
-        // so it's a real second opinion worth trying, not just a retry of
-        // the same failure.
-        if (isYoutubeUrl(url)) {
-          const ytdlJson = await tryExtractViaYtdlCore(url);
-          if (ytdlJson) return res.json(ytdlJson);
-        }
-
-        return res.status(502).json({
-          error: 'extraction_failed',
-          message: message.slice(-1000),
-        });
-      }
       try {
-        // yt-dlp sometimes prints warnings to stdout before the JSON line;
-        // the JSON payload is always the last non-empty line.
+        if (err) {
+          const message = (stderr || err.message || '').toString();
+          console.error(`[extract] yt-dlp failed for ${url}:`, message);
+
+          // Last-resort fallback for Instagram photo posts
+          if (url.includes('instagram.com') && /no video in this post/i.test(message)) {
+            const photoJson = await tryExtractInstagramPhoto(url);
+            if (photoJson) {
+              extractionCache.set(url, photoJson, EXTRACTION_CACHE_TTL_MS);
+              return res.json(photoJson);
+            }
+          }
+
+          // Fallback to @distube/ytdl-core for YouTube
+          if (isYoutubeUrl(url)) {
+            const ytdlJson = await tryExtractViaYtdlCore(url);
+            if (ytdlJson) {
+              extractionCache.set(url, ytdlJson, EXTRACTION_CACHE_TTL_MS);
+              return res.json(ytdlJson);
+            }
+          }
+
+          return res.status(502).json({
+            error: 'extraction_failed',
+            message: message.slice(-1000),
+          });
+        }
+
         const lines = stdout.trim().split('\n').filter(Boolean);
         const json = JSON.parse(lines[lines.length - 1]);
 
-        // If it's YouTube and yielded 0 formats, do not treat as photo post.
-        // Attempt fallback via @distube/ytdl-core or report error.
+        // If YouTube returned 0 formats, try ytdl-core fallback
         if (!json.formats || json.formats.length === 0) {
           if (isYoutubeUrl(url)) {
             console.log('[extract] YouTube video yielded 0 formats from yt-dlp, attempting fallback via ytdl-core...');
             const ytdlJson = await tryExtractViaYtdlCore(url);
             if (ytdlJson && ytdlJson.formats && ytdlJson.formats.length > 0) {
+              extractionCache.set(url, ytdlJson, EXTRACTION_CACHE_TTL_MS);
               return res.json(ytdlJson);
             }
             return res.status(502).json({
@@ -168,18 +595,23 @@ app.post('/extract', checkAuth, (req, res) => {
           }
         }
 
+        // Cache valid extraction result (2 hours TTL)
+        extractionCache.set(url, json, EXTRACTION_CACHE_TTL_MS);
         return res.json(json);
       } catch (parseErr) {
         console.error('[extract] failed to parse yt-dlp output:', parseErr.message);
 
-        // Same Instagram photo fallback if --ignore-no-formats-error still
-        // produced no parseable JSON line.
         if (url.includes('instagram.com')) {
           const photoJson = await tryExtractInstagramPhoto(url);
-          if (photoJson) return res.json(photoJson);
+          if (photoJson) {
+            extractionCache.set(url, photoJson, EXTRACTION_CACHE_TTL_MS);
+            return res.json(photoJson);
+          }
         }
 
         return res.status(502).json({ error: 'parse_failed', message: parseErr.message });
+      } finally {
+        release();
       }
     }
   );
@@ -206,6 +638,8 @@ function ytdlpArgs(url) {
     // metadata JSON (title/thumbnail/etc.) with an empty `formats` list,
     // which we turn into a downloadable "photo" format below.
     '--ignore-no-formats-error',
+    '--js-runtimes', 'deno,node',
+    '--remote-components', 'ejs:github',
   ];
   if (YTDLP_PLUGIN_DIRS) {
     args.push('--plugin-dirs', YTDLP_PLUGIN_DIRS);

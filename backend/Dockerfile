@@ -1,25 +1,19 @@
-FROM node:20-slim
+FROM node:22-slim
 
-# yt-dlp needs Python + ffmpeg (ffmpeg is used for merging/remuxing formats).
-#
-# YouTube now requires a "PO Token" (proof-of-origin) on most extraction
-# requests — without one, yt-dlp fails with "Failed to extract any player
-# response" on nearly every video, regardless of how up to date yt-dlp is.
-# bgutil-ytdlp-pot-provider is the fix the yt-dlp maintainers themselves
-# point to: a small local server that generates these tokens, plus a yt-dlp
-# plugin that talks to it. We install both here:
-#   - the plugin via `pip install --target`, so yt-dlp's standalone binary
-#     can find it via --plugin-dirs (it has no site-packages of its own)
-#   - the token-generating server, built from source into /opt/bgutil,
-#     started by server.js alongside the main process (see startBgutilPotServer)
+# yt-dlp needs Python + ffmpeg + a modern JS runtime (Node 22+ / Deno) for YouTube EJS challenge solving.
+# YouTube requires:
+# 1. PO Token provider (bgutil)
+# 2. Modern JS runtime (Node 22 / Deno) + yt-dlp-ejs for YouTube signature/n-challenge solving
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends python3 python3-pip ffmpeg curl ca-certificates git && \
+    apt-get install -y --no-install-recommends python3 python3-pip ffmpeg curl ca-certificates git unzip && \
     curl -L https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && \
     chmod a+rx /usr/local/bin/yt-dlp && \
-    pip3 install --no-cache-dir --target /opt/ytdlp-plugins bgutil-ytdlp-pot-provider && \
+    curl -fsSL https://deno.land/install.sh | sh && \
+    mv /root/.deno/bin/deno /usr/local/bin/deno && \
+    pip3 install --no-cache-dir --break-system-packages --target /opt/ytdlp-plugins bgutil-ytdlp-pot-provider yt-dlp-ejs && \
     git clone --depth 1 --branch 1.3.2 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /opt/bgutil && \
     cd /opt/bgutil/server && npm ci && npx tsc && \
-    apt-get purge -y git curl && \
+    apt-get purge -y git unzip && \
     apt-get autoremove -y && \
     rm -rf /var/lib/apt/lists/*
 

@@ -53,3 +53,4 @@ app.*.map.json
 # Never commit real YouTube session cookies (used as a backend PO Token workaround)
 backend/cookies.txt
 **/cookies.txt
+*cookies*.txt
